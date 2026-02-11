@@ -1,0 +1,189 @@
+
+============================================================
+[2026-02-09 08:52:19 UTC] PREFLIGHT
+Cannot start entity
+----------------------------------------
+Cargo not found.
+
+The Rust toolchain is required. Install it from https://rustup.rs and ensure 'Add to PATH' was selected, or add your .cargo\bin folder to PATH.
+============================================================
+
+============================================================
+[2026-02-09 09:00:51 UTC] PROCESS_EXIT
+Entity exited (101)
+----------------------------------------
+The entity process exited unexpectedly.
+
+Check the output below for errors. Common fixes:
+• Install Rust (rustup.rs) and ensure cargo is on PATH
+• Run from a terminal where 'cargo' works, then start the dashboard from that same environment
+
+Last output:
+error: could not compile `getrandom` (build script) due to 1 previous error
+error: could not compile `crossbeam-utils` (build script) due to 1 previous error
+error: could not compile `serde` (build script) due to 1 previous error
+error: could not compile `quote` (build script) due to 1 previous error
+error: could not compile `libm` (build script) due to 1 previous error
+error: could not compile `serde_core` (build script) due to 1 previous error
+error: could not compile `zerocopy` (build script) due to 1 previous error
+error: could not compile `getrandom` (build script) due to 1 previous error
+error: could not compile `target-features` (build script) due to 1 previous error
+Traceback (most recent call last):
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 141, in <module>
+main()
+~~~~^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 135, in main
+run_void()
+~~~~~~~~^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 87, in run_void
+write_sens_chunk(TYPE_VIDEO, rgb_bytes)
+~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 47, in write_sens_chunk
+sys.stdout.buffer.flush()
+~~~~~~~~~~~~~~~~~~~~~~~^^
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+OSError: [Errno 22] Invalid argument
+
+--- details ---
+Compiling libm v0.2.16
+Compiling zerocopy v0.8.39
+Compiling crossbeam-utils v0.8.21
+Compiling windows-link v0.2.1
+Compiling rayon-core v1.13.0
+Compiling getrandom v0.3.4
+Compiling serde_core v1.0.228
+Compiling either v1.15.0
+Compiling serde v1.0.228
+Compiling target-features v0.1.6
+Compiling find-msvc-tools v0.1.9
+Compiling shlex v1.3.0
+error: linker `link.exe` not found
+|
+= note: program not found
+
+note: the msvc targets depend on the msvc linker but `link.exe` was not found
+
+note: please ensure that Visual Studio 2017 or later, or Build Tools for Visual Studio were installed with the Visual C++ option.
+
+note: VS Code is a different product, and is not sufficient.
+
+error: could not compile `proc-macro2` (build script) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `rayon-core` (build script) due to 1 previous error
+error: could not compile `getrandom` (build script) due to 1 previous error
+error: could not compile `crossbeam-utils` (build script) due to 1 previous error
+error: could not compile `serde` (build script) due to 1 previous error
+error: could not compile `quote` (build script) due to 1 previous error
+error: could not compile `libm` (build script) due to 1 previous error
+error: could not compile `serde_core` (build script) due to 1 previous error
+error: could not compile `zerocopy` (build script) due to 1 previous error
+error: could not compile `getrandom` (build script) due to 1 previous error
+error: could not compile `target-features` (build script) due to 1 previous error
+Traceback (most recent call last):
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 141, in <module>
+main()
+~~~~^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 135, in main
+run_void()
+~~~~~~~~^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 87, in run_void
+write_sens_chunk(TYPE_VIDEO, rgb_bytes)
+~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+File "G:\Sanctuary\quaternity-emergence-main\quaternity_organism\scripts\signal_generator.py", line 47, in write_sens_chunk
+sys.stdout.buffer.flush()
+~~~~~~~~~~~~~~~~~~~~~~~^^
+BrokenPipeError: [Errno 32] Broken pipe
+Exception ignored while flushing sys.stdout:
+OSError: [Errno 22] Invalid argument
+============================================================
+
+============================================================
+[2026-02-10 05:35:26 UTC] PROCESS_EXIT
+Entity exited (1)
+----------------------------------------
+The entity process exited unexpectedly.
+
+Check the output below for errors. Common fixes:
+• Install Rust (rustup.rs) and ensure cargo is on PATH
+• Run from a terminal where 'cargo' works, then start the dashboard from that same environment
+
+Last output:
+warning: function `extract_visual_signature` is never used
+--> src\main.rs:659:4
+|
+659 | fn extract_visual_signature(
+|    ^^^^^^^^^^^^^^^^^^^^^^^^
+|
+= note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `extract_audio_signature_from_analysis` is never used
+--> src\main.rs:698:4
+|
+698 | fn extract_audio_signature_from_analysis(audio: &AudioAnalysis) -> Option<AudioSignature> {
+|    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_region` is never used
+--> src\main.rs:721:4
+|
+721 | fn extract_region(img: &image::GrayImage, rect: &Rect) -> Option<image::GrayImage> {
+|    ^^^^^^^^^^^^^^
+
+warning: `quaternity-organism` (bin "quaternity-organism") generated 15 warnings (run `cargo fix --bin "quaternity-organism" -p quaternity-organism` to apply 11 suggestions)
+Finished `release` profile [optimized] target(s) in 1.02s
+Running `target\release\quaternity-organism.exe resume`
+[2026-02-10T05:35:26Z ERROR quaternity_organism] Regeneration failed: Regeneration failed: no state file at data\checkpoint\state.bin. Entropy has won.. Entropy has won.
+error: process didn't exit successfully: `target\release\quaternity-organism.exe resume` (exit code: 1)
+
+--- details ---
+|
+207 |         let coherence = metabolism.tick();
+|             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_coherence`
+
+warning: unused variable: `coherence`
+--> src\main.rs:270:13
+|
+270 |         let coherence = metabolism.get_coherence();
+|             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_coherence`
+
+warning: value assigned to `agent_phase` is never read
+--> src\main.rs:179:32
+|
+179 |     let mut agent_phase: f32 = 0.0; // Current intention/direction phase
+|                                ^^^
+|
+= help: maybe it is overwritten before being read?
+= note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `entropy`
+--> src\main.rs:663:50
+|
+663 |     if let (StimulusSource::VisualRegion { rect, entropy, average_color }, Some(f)) = (&stimulus.source, frame) {
+|                                                  ^^^^^^^ help: try ignoring the field: `entropy: _`
+
+warning: function `extract_visual_signature` is never used
+--> src\main.rs:659:4
+|
+659 | fn extract_visual_signature(
+|    ^^^^^^^^^^^^^^^^^^^^^^^^
+|
+= note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `extract_audio_signature_from_analysis` is never used
+--> src\main.rs:698:4
+|
+698 | fn extract_audio_signature_from_analysis(audio: &AudioAnalysis) -> Option<AudioSignature> {
+|    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `extract_region` is never used
+--> src\main.rs:721:4
+|
+721 | fn extract_region(img: &image::GrayImage, rect: &Rect) -> Option<image::GrayImage> {
+|    ^^^^^^^^^^^^^^
+
+warning: `quaternity-organism` (bin "quaternity-organism") generated 15 warnings (run `cargo fix --bin "quaternity-organism" -p quaternity-organism` to apply 11 suggestions)
+Finished `release` profile [optimized] target(s) in 1.02s
+Running `target\release\quaternity-organism.exe resume`
+[2026-02-10T05:35:26Z ERROR quaternity_organism] Regeneration failed: Regeneration failed: no state file at data\checkpoint\state.bin. Entropy has won.. Entropy has won.
+error: process didn't exit successfully: `target\release\quaternity-organism.exe resume` (exit code: 1)
+============================================================

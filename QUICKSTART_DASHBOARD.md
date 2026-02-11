@@ -1,0 +1,83 @@
+# Sanctuary Dashboard - Quick Start Guide
+
+## Prerequisites
+
+- **Python 3.8+** installed and on your PATH.
+  If `python --version` fails, install from [python.org](https://www.python.org/downloads/) and check **"Add Python to PATH"**.
+- **Rust** (stable): Install from [rustup.rs](https://rustup.rs/)
+
+## Installation
+
+```bash
+# Install Python dependencies
+pip install -r scripts/requirements.txt
+
+# Build the Rust organism (release mode)
+cargo build --release
+```
+
+## Launch the Dashboard
+
+```bash
+python scripts/dashboard.py
+```
+
+(Use `python3` instead of `python` on Linux/macOS if needed.)
+
+You should see the Mission Control window with:
+- Two side-by-side field visualizations
+- Control panel at the bottom
+- Dark cyberpunk theme
+
+## Running the Organism
+
+1. **Launch the dashboard** (as above)
+2. **Click "Initialize Entity"** to create a fresh organism
+3. **Click "Start Simulation"** to begin the 90Hz processing loop
+4. After a few seconds, the field visualization will begin updating
+5. Watch efficiency, resonance, and coherence in real time
+
+### With Video Stimulus
+
+1. Select **"External File"** as the stimulus source
+2. Click **"Browse"** and select a video file (MP4, AVI, MOV)
+3. Click **"Start Simulation"**
+4. The video frames and audio are streamed to the organism as sensory input
+
+**Note**: Video stimulus requires `ffmpeg` installed for audio extraction, and `opencv-python-headless` (`pip install opencv-python-headless`).
+
+## What You'll See
+
+### Left Plot: Physical Field
+- Phase encoded as hue, resonance as brightness
+- The white dot is the organism's current position
+- Bright colored trails = reinforced territory
+- Dark regions = void or decayed
+
+### Right Plot: Efficiency Field
+- Custom **HarmonicAscension** colormap
+- Red = low efficiency (survival mode)
+- Green = equilibrium
+- Violet/White = resonance amplification (efficiency > 1.0)
+
+## Controls
+
+- **Tail Length Slider**: Adjust history depth (100-5000 data points)
+- **View W / H Sliders**: Adjust field viewport size
+- **Stop Simulation**: Gracefully stops the organism (state is auto-saved)
+- **Save/Load**: Checkpoint organism state to `.qsim` files
+
+## Troubleshooting
+
+### "Plots are empty"
+- Ensure the simulation is running (status shows "Running")
+- Wait a few seconds for data to be generated
+- Check that `data/metrics/` directory contains `.parquet` files
+
+### "Can't start simulation"
+- Build the release binary first: `cargo build --release`
+- Check that `target/release/quaternity-organism` (or `.exe`) exists
+
+### Performance issues
+- Reduce the **Tail Length** slider
+- Reduce **View W** and **H** sliders

@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+
+# Runtime data (metrics, logs, checkpoints, saves)
+# Uncomment the next line to track data in version control:
+# !data/.gitkeep
+/data/metrics/
+/data/logs/
+/data/checkpoint/
+# Keep save files directory structure but not the saves themselves
+/data/saves/*.qsim
+
+# Analysis output
+analysis_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
