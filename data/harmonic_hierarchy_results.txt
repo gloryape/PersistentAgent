@@ -1,0 +1,70 @@
+═══════════════════════════════════════════════════════════════
+  HARMONIC HIERARCHY: Complexity Hierarchy Demonstration
+═══════════════════════════════════════════════════════════════
+  Histories: 40
+  Probe phases: 8
+  γ₂ values tested: [0.0, 0.3, 0.5, 0.8, 1.0]
+  Tests per γ₂: 320
+
+─── CONTROL: γ₂=0 vs original calculate_resonance ───
+  Max |original - resonance_2h(γ₂=0)|: 0.00e0
+  ✓ Two-harmonic function matches original when γ₂=0
+
+─── HIERARCHY RESULTS ───
+     γ₂ |    d=2 max err   d=2 mean err |    d=4 max err   d=4 mean err | Verdict
+  -----------------------------------------------------------------------------------------------
+    0.0 |        1.79e-7        2.79e-8 |        1.79e-7        2.79e-8 | Both work (no 2nd harmonic content)
+    0.3 |        2.31e-1        6.67e-2 |        1.79e-7        2.83e-8 | d=2 FAILS, d=4 WORKS
+    0.5 |        3.33e-1        9.63e-2 |        1.49e-7        2.61e-8 | d=2 FAILS, d=4 WORKS
+    0.8 |        4.44e-1        1.28e-1 |        1.19e-7        2.29e-8 | d=2 FAILS, d=4 WORKS
+    1.0 |        5.00e-1        1.44e-1 |        1.19e-7        2.10e-8 | d=2 FAILS, d=4 WORKS
+
+─── ANALYSIS ───
+  ✓ γ₂=0 control: d=2 and d=4 both exact (first harmonic only)
+  ✓ γ₂=1 hierarchy: d=2 FAILS, d=4 exact
+
+  HIERARCHY DEMONSTRATED:
+    Adding the second harmonic cos(2(θ-θᵢ)) to the kernel
+    doubles the required sufficient statistic dimension.
+    d=2 max error at γ₂=1: 0.5000
+    d=4 max error at γ₂=1: 1.19e-7
+
+  This empirically confirms the complexity hierarchy:
+    K=1 harmonic  → d=2
+    K=2 harmonics → d=4
+    K harmonics   → d=2K (by extension)
+    K=∞           → d=∞ (irreducible)
+
+─── MATHEMATICAL EXPLANATION ───
+  The two-harmonic resonance function is:
+    res(θ) = [Σᵢ wᵢaᵢcos(θ-θᵢ) + γ₂·Σᵢ wᵢaᵢcos(2(θ-θᵢ))] / [(1+γ₂)W]
+
+  Expanding both cosines:
+    cos(θ-θᵢ)   = cos(θ)cos(θᵢ) + sin(θ)sin(θᵢ)
+    cos(2(θ-θᵢ)) = cos(2θ)cos(2θᵢ) + sin(2θ)sin(2θᵢ)
+
+  So: res(θ) = [cos(θ)·C₁ + sin(θ)·S₁ + γ₂(cos(2θ)·C₂ + sin(2θ)·S₂)] / [(1+γ₂)W]
+
+  The d=2 statistic (C₁/W, S₁/W) captures only the first two terms.
+  The d=4 statistic (C₁/W, S₁/W, C₂/W, S₂/W) captures all four.
+
+  Each harmonic k adds TWO dimensions to the sufficient statistic:
+    (Cₖ/W, Sₖ/W) = (Σ wᵢaᵢcos(kθᵢ)/W, Σ wᵢaᵢsin(kθᵢ)/W)
+
+  For K harmonics: d = 2K. For K → ∞: d → ∞.
+  This is the Fourier decomposition of the phase history distribution.
+  A kernel sensitive to all Fourier modes requires the complete
+  distribution — no finite summary suffices.
+
+─── IMPLICATIONS FOR PAPER #2 ───
+  This result transforms the complexity hierarchy from a theoretical
+  prediction into an empirical demonstration. The paper can now state:
+
+  'We demonstrate the first step of the complexity hierarchy
+   computationally. A kernel with K circular harmonics requires a
+   sufficient statistic of dimension d=2K. We verify this for K=1
+   (d=2, Section 6) and K=2 (d=4, this section). The extension to
+   arbitrary K is immediate by the Fourier decomposition argument.
+   A kernel coupling to all harmonics — equivalent to the full phase
+   distribution rather than its moments — requires d=∞ and cannot be
+   reduced to any finite state augmentation.'

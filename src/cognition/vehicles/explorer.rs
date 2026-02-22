@@ -16,9 +16,10 @@
 //! If Explorer is active twice in succession without new external input,
 //! Presence must emit a reanchor event. This prevents runaway abstraction.
 
-use super::{Vehicle, VehicleType, Perspective, MemoryContext};
+use super::{Vehicle, VehicleType, Perspective, MemoryContext, EnvironmentContext};
 use crate::cognition::triune::TriuneResult;
 use crate::motor::Modality;
+use std::cmp::Ordering;
 
 /// The Explorer Vehicle - Possibility awareness
 pub struct ExplorerVehicle {
@@ -104,42 +105,74 @@ impl Vehicle for ExplorerVehicle {
         VehicleType::Explorer
     }
 
-    fn interpret(&self, triune: &TriuneResult, memory_context: Option<&MemoryContext>) -> Perspective {
-        let possibility_space = self.assess_possibility_space(triune);
-        let mut confidence = self.assess_confidence(triune);
-        
-        // Memory context affects exploration
-        if let Some(ctx) = memory_context {
-            // If we've explored similar territory before, slightly less confident
-            // (we've been here before, might not need to explore again)
-            if ctx.familiarity > 0.7 {
-                confidence = (confidence - 0.1).max(0.0);
-            }
-            // If past exploration led to good outcomes, more confident
-            if ctx.past_outcome_valence > 0.7 {
-                confidence = (confidence + 0.1).min(1.0);
-            }
-        }
-        
-        // Explorer always suggests waiting/observing (eyes/ears) rather than acting
-        // The point is to NOT resolve, to hold open
-        let modality_hint = if possibility_space > self.exploration_threshold {
-            // High possibility = observe more
-            Some(Modality::Eyes)  // Look for more information
-        } else {
-            // Low possibility = no strong suggestion
-            None
+    fn interpret(
+        &self,
+        triune: &TriuneResult,
+        memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
+    ) -> Perspective {
+        let env = match env_context {
+            Some(e) => e,
+            None => return Perspective::empty(VehicleType::Explorer),
         };
-        
+
+        // Subjective novelty (Memory is Being): steer toward high-novelty quadrants,
+        // explicitly AVOIDING lethal max-stiffness walls AND the comfort-trap of the pure vacuum.
+        let max_stiff = env.quadrant_stiffness.iter().cloned().fold(0.0f32, f32::max);
+        let min_stiff = env.quadrant_stiffness.iter().cloned().fold(f32::MAX, f32::min);
+        let at_max_count = env.quadrant_stiffness
+            .iter()
+            .filter(|&&s| s >= max_stiff * 0.95)
+            .count();
+
+        let score = |q: usize| -> f32 {
+            let novelty = env.quadrant_novelty[q];
+            let stiff = env.quadrant_stiffness[q];
+            // Only exclude as lethal when this quadrant is distinctly the stiffest (a wall)
+            let lethal = if max_stiff > 0.5 && stiff >= max_stiff * 0.95 && at_max_count < 4 {
+                0.0
+            } else {
+                1.0
+            };
+            // Exclude vacuum trap (min stiffness = empty corner)
+            let vacuum_trap = if min_stiff < f32::MAX && stiff <= min_stiff + 0.001 && min_stiff < 0.01
+            {
+                0.3
+            } else {
+                1.0
+            };
+            novelty * lethal * vacuum_trap
+        };
+
+        let (best_q, best_score) = (0..4)
+            .map(|q| (q, score(q)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+            .unwrap_or((0, 0.0));
+
+        let max_novelty = env.quadrant_novelty.iter().cloned().fold(0.0f32, f32::max);
+        let min_novelty = env.quadrant_novelty.iter().cloned().fold(f32::MAX, f32::min);
+        let novelty_gradient = if max_novelty - min_novelty > 0.001 {
+            (max_novelty - min_novelty).min(1.0)
+        } else {
+            0.0
+        };
+        let confidence = novelty_gradient;
+
         Perspective {
             vehicle_type: VehicleType::Explorer,
             structural_truth: None,
             emotional_intent: None,
             identity_alignment: None,
-            possibility_space: Some(possibility_space),
-            modality_hint,
+            possibility_space: Some(env.quadrant_novelty[best_q]),
+            modality_hint: Some(Modality::Eyes),
+            recommended_quadrant: Some(best_q as u8),
             confidence,
-            interpretation: self.generate_interpretation(possibility_space, triune),
+            interpretation: format!(
+                "Subjective novelty: Q{} highest (novelty={:.2}, score={:.2})",
+                best_q,
+                env.quadrant_novelty[best_q],
+                best_score
+            ),
         }
     }
 }
@@ -157,10 +190,8 @@ mod tests {
     use crate::cognition::triune::{AnalyticalAssessment, ExperientialAssessment, TriuneResult};
 
     #[test]
-    fn test_explorer_high_possibility() {
+    fn test_explorer_empty_without_env_context() {
         let explorer = ExplorerVehicle::new();
-        
-        // High novelty + high dissonance = high possibility
         let analytical = AnalyticalAssessment {
             internal_consistency: 0.5,
             expectation_match: 0.3,
@@ -168,7 +199,6 @@ mod tests {
             signal_strength: 0.8,
             timestamp: Instant::now(),
         };
-        
         let experiential = ExperientialAssessment {
             resonance: 0.4,
             aversion: 0.6,
@@ -176,12 +206,47 @@ mod tests {
             signal_strength: 0.8,
             timestamp: Instant::now(),
         };
-        
         let triune = TriuneResult::from_assessments(analytical, experiential);
-        let perspective = explorer.interpret(&triune, None);
-        
+        let perspective = explorer.interpret(&triune, None, None);
+        assert!(perspective.recommended_quadrant.is_none());
+        assert!(perspective.confidence == 0.0);
+    }
+
+    #[test]
+    fn test_explorer_high_possibility_with_env_context() {
+        let explorer = ExplorerVehicle::new();
+        let analytical = AnalyticalAssessment {
+            internal_consistency: 0.5,
+            expectation_match: 0.3,
+            structural_novelty: 0.9,
+            signal_strength: 0.8,
+            timestamp: Instant::now(),
+        };
+        let experiential = ExperientialAssessment {
+            resonance: 0.4,
+            aversion: 0.6,
+            salience: 0.7,
+            signal_strength: 0.8,
+            timestamp: Instant::now(),
+        };
+        let triune = TriuneResult::from_assessments(analytical, experiential);
+        let env = EnvironmentContext {
+            quadrant_stiffness: [0.5; 4],
+            quadrant_amplitude: [0.2, 0.8, 0.1, 0.1],
+            quadrant_visit_count: [0, 10, 5, 3],
+            quadrant_recent_efficiency: [None; 4],
+            current_heading_quadrant: 0,
+            heading_consistency: 0.5,
+            brightest_quadrant: 1,
+            has_novel_structure: [true, false, false, false],
+            quadrant_novelty: [0.8, 0.2, 0.3, 0.3],
+            agent_voxel: (0, 0, 0),
+            has_local_phase_history: [false; 4],
+        };
+        let perspective = explorer.interpret(&triune, None, Some(&env));
         assert!(perspective.possibility_space.unwrap() > 0.5);
         assert!(perspective.confidence > 0.4);
+        assert_eq!(perspective.recommended_quadrant, Some(0));
     }
 }
 

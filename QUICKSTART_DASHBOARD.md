@@ -8,8 +8,12 @@
 
 ## Installation
 
+From the **quaternity_organism** directory:
+
 ```bash
-# Install Python dependencies
+cd quaternity_organism
+
+# Install Python dependencies (dashboard + analysis)
 pip install -r scripts/requirements.txt
 
 # Build the Rust organism (release mode)
@@ -29,13 +33,15 @@ You should see the Mission Control window with:
 - Control panel at the bottom
 - Dark cyberpunk theme
 
-## Running the Organism
+## Running the Organism (resume testing)
 
-1. **Launch the dashboard** (as above)
-2. **Click "Initialize Entity"** to create a fresh organism
-3. **Click "Start Simulation"** to begin the 90Hz processing loop
-4. After a few seconds, the field visualization will begin updating
-5. Watch efficiency, resonance, and coherence in real time
+1. **Launch the dashboard**: `python scripts/dashboard.py`
+2. **Click "Initialize Entity"** — creates a fresh run (new run UUID, null state).
+3. **Click "Start Simulation"** — starts the organism; the Rust binary runs in the background and writes metrics to `data/metrics/`.
+4. After a few seconds the field view updates; AGE and Tick advance. You can now resume testing (vehicle distribution, efficiency, multi-agent behavior).
+5. **Stop Simulation** when done; state is auto-saved so you can **Resume** later from the same run.
+
+Multi-agent runs show multiple colored markers in the field (one per agent). The metrics bar shows "Agents: N" when `agent_id` is present in the data.
 
 ### With Video Stimulus
 

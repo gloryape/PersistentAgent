@@ -289,8 +289,13 @@ class DataReader:
             return stem.split("_epoch_")[0]
         return stem
 
-    def read_latest_data(self) -> Optional[pd.DataFrame]:
-        """Read the latest data from parquet files (current run only in live mode)."""
+    def read_latest_data(self, only_recent_seconds: Optional[float] = None) -> Optional[pd.DataFrame]:
+        """
+        Read the latest data from parquet files (current run only).
+        When only_recent_seconds is set (e.g. 30), only consider files modified within
+        that window — so the "current run" is the one being written to right now,
+        and we don't show stale data from an old run when a new run has just started.
+        """
         if not self.metrics_dir.exists():
             return None
 
@@ -301,6 +306,14 @@ class DataReader:
 
         if not parquet_files:
             return None
+
+        if only_recent_seconds is not None and only_recent_seconds > 0:
+            cutoff = time.time() - only_recent_seconds
+            parquet_files = [p for p in parquet_files if p.stat().st_mtime >= cutoff]
+            if not parquet_files:
+                self.last_file = None
+                self.last_mtime = 0
+                return None
 
         latest_file = parquet_files[-1]
         current_mtime = latest_file.stat().st_mtime
@@ -334,86 +347,6 @@ class DataReader:
         self._full_df = full_df
         return full_df.tail(self.tail_length)
 
-    def read_all_data(self) -> Optional[pd.DataFrame]:
-        """Read all available parquet data (for history mode)."""
-        if not self.metrics_dir.exists():
-            return None
-
-        parquet_files = sorted(
-            self.metrics_dir.glob("*.parquet"),
-            key=lambda p: p.stat().st_mtime
-        )
-
-        if not parquet_files:
-            return None
-
-        frames = []
-        for file_path in parquet_files:
-            try:
-                df = pd.read_parquet(file_path)
-                frames.append(df)
-            except Exception as e:
-                print(f"Error reading {file_path}: {e}")
-                continue
-
-        if not frames:
-            return None
-
-        full_df = pd.concat(frames, ignore_index=True)
-        if 'tick' in full_df.columns:
-            full_df = full_df.sort_values('tick')
-
-        self._full_df = full_df
-        return full_df
-
-    def get_data_at_engine_hour(self, target_hour: float, window_hours: float = 0.01) -> Optional[pd.DataFrame]:
-        """
-        Get data around a specific engine hour for history scrubbing.
-        
-        Args:
-            target_hour: The engine hour to seek to.
-            window_hours: Time window around target (default ~36 seconds).
-        
-        Returns:
-            DataFrame filtered to the requested time window.
-        """
-        if self._full_df is None:
-            self.read_all_data()
-
-        if self._full_df is None or self._full_df.empty:
-            return None
-
-        if 'engine_hours' not in self._full_df.columns:
-            # Fallback: return tail of full data
-            return self._full_df.tail(self.tail_length)
-
-        # Filter to window around target engine hour
-        half_window = window_hours / 2.0
-        lower = target_hour - half_window
-        upper = target_hour + half_window
-        mask = (self._full_df['engine_hours'] >= lower) & (self._full_df['engine_hours'] <= upper)
-        filtered = self._full_df[mask]
-
-        if filtered.empty:
-            # Find closest data point and grab surrounding window
-            idx = (self._full_df['engine_hours'] - target_hour).abs().idxmin()
-            center = max(0, idx - self.tail_length // 2)
-            end = min(len(self._full_df), center + self.tail_length)
-            return self._full_df.iloc[center:end]
-
-        return filtered.tail(self.tail_length)
-
-    def get_max_engine_hours(self) -> float:
-        """Get the maximum engine hours in the dataset."""
-        if self._full_df is not None and 'engine_hours' in self._full_df.columns:
-            return float(self._full_df['engine_hours'].max())
-        return 0.0
-
-    def set_tail_length(self, length: int):
-        """Update the tail length."""
-        self.tail_length = length
-        # Invalidate cache so the next read picks up data with the new tail length
-        self.last_mtime = 0
 
 
 class EntityDashboard:
@@ -429,7 +362,7 @@ class EntityDashboard:
     
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Entity Control — 2D Engine Hours")
+        self.root.title("Entity Control — Multi-Agent 2D Engine Hours")
         self.root.geometry("1600x900")
         
         # Apply dark theme
@@ -443,8 +376,6 @@ class EntityDashboard:
         self.is_running = False
         self._sim_output_lines: List[str] = []  # capture output to show on failure
         self.tail_length = 1000
-        self.live_mode = True  # True = live updates, False = history scrub
-        self.history_hour = 0.0  # Current position of history scrubber
         
         # Data reader
         self.data_reader = DataReader(DEFAULT_METRICS_DIR, self.tail_length)
@@ -495,6 +426,14 @@ class EntityDashboard:
         
     def _create_ui(self):
         """Create the main UI layout with 2D plots and controls."""
+        # === MENU BAR: File menu for Save/Load ===
+        menubar = tk.Menu(self.root, bg='#1a1f3a', fg=self.fg_color)
+        self.file_menu = tk.Menu(menubar, tearoff=0, bg='#1a1f3a', fg=self.fg_color)
+        self.file_menu.add_command(label="Save Simulation", command=self._save_simulation, state='disabled')
+        self.file_menu.add_command(label="Load Simulation", command=self._load_simulation)
+        menubar.add_cascade(label="File", menu=self.file_menu)
+        self.root.config(menu=menubar)
+
         # Main container
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -510,22 +449,19 @@ class EntityDashboard:
         )
         title_label.pack(side=tk.LEFT)
         
-        # Engine Hours display (prominent)
+        # Engine Hours + Tick display (prominent; Tick shows data is flowing)
         self.engine_hours_label = ttk.Label(
             top_bar,
             text="AGE: 0.0000 HOURS",
             style='EngineHours.TLabel'
         )
         self.engine_hours_label.pack(side=tk.RIGHT, padx=20)
-        
-        # Mode indicator
-        self.mode_label = ttk.Label(
+        self.tick_label = ttk.Label(
             top_bar,
-            text="[LIVE]",
-            foreground='#00ff00',
-            font=('Courier', 12, 'bold')
+            text="Tick: --",
+            style='EngineHours.TLabel'
         )
-        self.mode_label.pack(side=tk.RIGHT, padx=10)
+        self.tick_label.pack(side=tk.RIGHT, padx=5)
         
         # === VISUALIZATION AREA: Field visualization (physical + ethical) ===
         viz_frame = ttk.Frame(main_frame)
@@ -573,43 +509,23 @@ class EntityDashboard:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
-        # === HISTORY SCRUBBER BAR ===
-        scrubber_frame = ttk.Frame(main_frame)
-        scrubber_frame.pack(fill=tk.X, pady=(5, 5))
+        # === METRICS BAR ===
+        metrics_frame = ttk.Frame(main_frame)
+        metrics_frame.pack(fill=tk.X, pady=(2, 2))
         
-        # Live mode checkbox
-        self.live_var = tk.BooleanVar(value=True)
-        self.live_checkbox = tk.Checkbutton(
-            scrubber_frame,
-            text="LIVE",
-            variable=self.live_var,
-            command=self._toggle_live_mode,
-            bg=self.bg_color,
-            fg=self.fg_color,
-            selectcolor='#1a1f3a',
-            activebackground=self.bg_color,
-            activeforeground=self.fg_color,
-            font=('Courier', 10, 'bold')
-        )
-        self.live_checkbox.pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Label(scrubber_frame, text="Engine Hour:").pack(side=tk.LEFT)
-        
-        self.history_var = tk.DoubleVar(value=0.0)
-        self.history_slider = ttk.Scale(
-            scrubber_frame,
-            from_=0.0,
-            to=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.history_var,
-            command=self._on_history_scrub,
-            length=800
-        )
-        self.history_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.history_slider.configure(state='disabled')  # Disabled in live mode
-        
-        self.history_value_label = ttk.Label(scrubber_frame, text="0.0000 h")
-        self.history_value_label.pack(side=tk.LEFT, padx=5)
+        self.metrics_labels = {}
+        metrics_spec = [
+            ("em", "EM: --"),
+            ("regime", "HIGH --% MID --%"),
+            ("eff", "Eff: --"),
+            ("observer", "Observer: --"),
+            ("agents", "Agents: --"),
+        ]
+        for key, default_text in metrics_spec:
+            lbl = ttk.Label(metrics_frame, text=default_text,
+                             foreground=self.accent_color, font=('Courier', 10))
+            lbl.pack(side=tk.LEFT, padx=(10, 20))
+            self.metrics_labels[key] = lbl
         
         # === CONTROL PANEL ===
         control_frame = ttk.Frame(main_frame)
@@ -654,7 +570,7 @@ class EntityDashboard:
         self.generator_combo = ttk.Combobox(
             input_frame,
             textvariable=self.generator_mode_var,
-            values=["Void", "Coherence"],
+            values=["Void", "Coherence", "Beacon"],
             state="readonly",
             width=14
         )
@@ -686,49 +602,19 @@ class EntityDashboard:
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         
-        # Save/Load frame
-        save_load_frame = ttk.Frame(left_controls)
-        save_load_frame.pack(side=tk.LEFT, padx=10)
-        self.save_btn = ttk.Button(
-            save_load_frame,
-            text="Save Simulation",
-            command=self._save_simulation,
-            state=tk.DISABLED
-        )
-        self.save_btn.pack(side=tk.LEFT, padx=5)
-        self.load_btn = ttk.Button(
-            save_load_frame,
-            text="Load Simulation",
-            command=self._load_simulation
-        )
-        self.load_btn.pack(side=tk.LEFT, padx=5)
-        
         # Status
         self.status_label = ttk.Label(left_controls, text="Status: Idle",
                                       foreground='#ffaa00')
         self.status_label.pack(side=tk.LEFT, padx=20)
         
+        # Version label (populated from organism's startup log)
+        self.version_label = ttk.Label(left_controls, text="",
+                                       foreground='#888888', font=('TkDefaultFont', 8))
+        self.version_label.pack(side=tk.LEFT, padx=10)
+        
         # Right controls (tail length and viewport size sliders)
         right_controls = ttk.Frame(control_frame)
         right_controls.pack(side=tk.RIGHT, padx=10)
-        
-        # Tail length slider
-        ttk.Label(right_controls, text="Tail Length:").pack(side=tk.LEFT)
-        
-        self.tail_var = tk.IntVar(value=1000)
-        self.tail_slider = ttk.Scale(
-            right_controls,
-            from_=100,
-            to=5000,
-            orient=tk.HORIZONTAL,
-            variable=self.tail_var,
-            command=self._update_tail_length,
-            length=150
-        )
-        self.tail_slider.pack(side=tk.LEFT, padx=5)
-        
-        self.tail_value_label = ttk.Label(right_controls, text="1000")
-        self.tail_value_label.pack(side=tk.LEFT, padx=(0, 15))
         
         # Viewport width slider
         ttk.Label(right_controls, text="View W:").pack(side=tk.LEFT)
@@ -829,30 +715,17 @@ class EntityDashboard:
             b = 0.0 + 0.55 * t   # 0.0 → 0.55
         return _np.array([r, g, b], dtype=_np.float64)
 
-    def _toggle_live_mode(self):
-        """Toggle between Live and History modes."""
-        self.live_mode = self.live_var.get()
-        
-        if self.live_mode:
-            self.mode_label.config(text="[LIVE]", foreground='#00ff00')
-            self.history_slider.configure(state='disabled')
-            # Invalidate data cache to force reload on next tick
-            self.data_reader.last_mtime = 0
-            self.last_valid_df = None  # Clear cache when switching modes
-        else:
-            self.mode_label.config(text="[HISTORY]", foreground='#ffaa00')
-            self.history_slider.configure(state='!disabled')
-            # Load all data for scrubbing
-            self.data_reader.read_all_data()
-            max_hours = self.data_reader.get_max_engine_hours()
-            if max_hours > 0:
-                self.history_slider.configure(to=max_hours)
-    
-    def _on_history_scrub(self, value):
-        """Handle history slider movement."""
-        self.history_hour = float(value)
-        self.history_value_label.config(text=f"{self.history_hour:.4f} h")
-    
+    @staticmethod
+    def _agent_color(agent_idx: int, coherence: float):
+        """Distinct color for non-primary agents. Cycles through cyan, magenta, yellow."""
+        import numpy as _np
+        hues = [0.5, 0.83, 0.17, 0.67]  # cyan, magenta, yellow, blue-violet
+        hue = hues[agent_idx % len(hues)]
+        brightness = 0.5 + 0.5 * coherence
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.9, brightness)
+        return _np.array([r, g, b], dtype=_np.float64)
+
     def _on_input_source_change(self):
         """Toggle state of Browse vs Generator dropdown."""
         is_file = self.stimulus_source_var.get() == "file"
@@ -888,10 +761,17 @@ class EntityDashboard:
         
         if src == "generator":
             mode_display = self.generator_mode_var.get()
-            mode = "void" if mode_display == "Void" else "coherence"
+            if mode_display == "Beacon":
+                mode = "void"
+            else:
+                mode = "void" if mode_display == "Void" else "coherence"
             python_cmd = f'python "{SIGNAL_GENERATOR_PATH}" --mode {mode}'
         elif self.stimulus_file:
             python_cmd = f'python "{OPTIC_NERVE_PATH}" --source "{self.stimulus_file}"'
+        else:
+            # External File selected but no file chosen: Rust blocks on stdin and never flushes metrics.
+            # Pipe the signal generator (Void) so the process gets frames and the dashboard can update.
+            python_cmd = f'python "{SIGNAL_GENERATOR_PATH}" --mode void'
         
         if python_cmd:
             return f'{python_cmd} | {rust_cmd}'
@@ -912,12 +792,15 @@ class EntityDashboard:
     def _start_entity(self, init_mode: bool):
         """Start the Entity subprocess (Initialize or Resume)."""
         self._sim_output_lines = []
-        use_generator = self.stimulus_source_var.get() == "generator"
+        src = self.stimulus_source_var.get()
+        # When External File is selected but no file chosen, we pipe the signal generator
+        # so the process doesn't block on stdin (and metrics can flush).
+        use_generator = src == "generator" or (src == "file" and not self.stimulus_file)
         
         # Debug: print current state
         print(f"\n{'='*60}")
         print(f"Starting entity (init={init_mode})")
-        print(f"  Stimulus source: {self.stimulus_source_var.get()}")
+        print(f"  Stimulus source: {src}")
         print(f"  Stimulus file: {self.stimulus_file}")
         print(f"  Use generator: {use_generator}")
         print(f"  Generator mode: {self.generator_mode_var.get()}")
@@ -939,6 +822,7 @@ class EntityDashboard:
             
             # Use env with Cargo on PATH (GUI often doesn't inherit shell PATH)
             run_env = _env_with_cargo_path()
+            run_env["RUST_LOG"] = "info"  # so Rust log::info! (e.g. [PROPRIO scan]) shows in [SIM] output
             self.simulation_process = subprocess.Popen(
                 cmd_str,
                 shell=True,
@@ -947,6 +831,8 @@ class EntityDashboard:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             
             print(f"Process started: PID {self.simulation_process.pid}")
@@ -956,14 +842,18 @@ class EntityDashboard:
             self.resume_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
             self.status_label.config(text="Status: Running", foreground='#00ff00')
+            # Sync beacon state so Rust polling thread enables/disables PHASE 1.5
+            beacon_file = ORGANISM_DIR / "data" / "beacon_enabled.txt"
+            beacon_file.parent.mkdir(parents=True, exist_ok=True)
+            beacon_file.write_text("1" if self.generator_mode_var.get() == "Beacon" else "0")
             # Force dashboard to re-read metrics from disk when new data appears
             self.data_reader.last_mtime = 0
             self.data_reader.last_file = None
             self.last_valid_df = None  # Clear cached data for fresh start
             if hasattr(self, 'cached_field_grid'):
                 delattr(self, 'cached_field_grid')
-            if hasattr(self, 'save_btn'):
-                self.save_btn.config(state=tk.NORMAL)
+            if hasattr(self, 'file_menu'):
+                self.file_menu.entryconfig("Save Simulation", state='normal')
             
             print("Entity started")
             
@@ -1040,9 +930,10 @@ class EntityDashboard:
             self.init_btn.config(state=tk.NORMAL)
             self.resume_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'save_btn'):
-                self.save_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'file_menu'):
+                self.file_menu.entryconfig("Save Simulation", state='disabled')
             self.status_label.config(text="Status: Stopped", foreground='#ffaa00')
+            self.version_label.config(text="")  # Clear version on stop
             # Clear cached data so next run starts fresh
             self.data_reader.last_mtime = 0
             self.data_reader.last_file = None
@@ -1099,6 +990,7 @@ class EntityDashboard:
         try:
             cmd_str = f'cargo run --release -- load --file "{file_path}"'
             run_env = _env_with_cargo_path()
+            run_env["RUST_LOG"] = "info"  # so Rust log::info! (e.g. [PROPRIO scan]) shows in [SIM] output
             self.simulation_process = subprocess.Popen(
                 cmd_str,
                 shell=True,
@@ -1107,13 +999,19 @@ class EntityDashboard:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             self.is_running = True
             self.init_btn.config(state=tk.DISABLED)
             self.resume_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
-            self.save_btn.config(state=tk.NORMAL)
+            if hasattr(self, 'file_menu'):
+                self.file_menu.entryconfig("Save Simulation", state='normal')
             self.status_label.config(text="Status: Running (loaded)", foreground='#00ff00')
+            beacon_file = ORGANISM_DIR / "data" / "beacon_enabled.txt"
+            beacon_file.parent.mkdir(parents=True, exist_ok=True)
+            beacon_file.write_text("1" if self.generator_mode_var.get() == "Beacon" else "0")
             self.data_reader.last_mtime = 0
             self.data_reader.last_file = None
             self.last_valid_df = None
@@ -1138,6 +1036,12 @@ class EntityDashboard:
                 # Keep only last 50 lines
                 if len(self._sim_output_lines) > 50:
                     self._sim_output_lines.pop(0)
+                
+                # Parse version line if present
+                if "[VERSION]" in line_stripped:
+                    # Extract version string after [VERSION]
+                    version_text = line_stripped.split("[VERSION]", 1)[-1].strip()
+                    self.root.after(0, lambda v=version_text: self.version_label.config(text=v))
         except Exception as e:
             print(f"Error reading simulation output: {e}")
         
@@ -1153,13 +1057,6 @@ class EntityDashboard:
                     full_msg = msg + f"\n\nDetails written to:\n{log_path}"
                     self.root.after(0, lambda: messagebox.showerror(title, full_msg))
                 self.root.after(0, self._stop_simulation)
-    
-    def _update_tail_length(self, value):
-        """Update the tail length from slider."""
-        tail_length = int(float(value))
-        self.tail_length = tail_length
-        self.data_reader.set_tail_length(tail_length)
-        self.tail_value_label.config(text=str(tail_length))
     
     def _update_viewport_width(self, value):
         """Update the viewport width from slider."""
@@ -1209,9 +1106,9 @@ class EntityDashboard:
         self._update_plots_impl(frame)
 
     def _update_plots_impl(self, frame):
-        # In live mode, only show data if simulation is actually running
+        # Only show data if simulation is actually running
         # (prevents displaying stale data from old runs on startup)
-        if self.live_mode and not self.is_running:
+        if not self.is_running:
             # Show waiting state until user starts a simulation
             if self.last_valid_df is None:
                 self._draw_waiting_state()
@@ -1220,18 +1117,22 @@ class EntityDashboard:
             # but don't reload from disk
             df = self.last_valid_df
         else:
-            # Determine data source based on mode
-            if self.live_mode:
-                df = self.data_reader.read_latest_data()
-            else:
-                df = self.data_reader.get_data_at_engine_hour(self.history_hour)
+            # Always live mode: only use data from files written in last 30s so we show
+            # the current run (not an old run) and age/tick advance as expected.
+            df = self.data_reader.read_latest_data(
+                only_recent_seconds=30.0 if self.is_running else None
+            )
             
             # If no data available, use cached data if we have it (prevents flickering)
+            # — but when running, don't show stale previous-run data; show "waiting" instead.
             if df is None or df.empty:
-                if self.last_valid_df is not None:
+                if self.last_valid_df is not None and not self.is_running:
                     df = self.last_valid_df
                 else:
-                    self._draw_waiting_state()
+                    if self.is_running:
+                        self._draw_waiting_state(running=True)
+                    else:
+                        self._draw_waiting_state()
                     return
             else:
                 self.last_valid_df = df
@@ -1244,7 +1145,7 @@ class EntityDashboard:
         )
         
         # Incremental update: only process new records if cached grid exists
-        if not hasattr(self, 'cached_field_grid') or not self.live_mode:
+        if not hasattr(self, 'cached_field_grid'):
             field_grid = reconstruct_field_from_parquet(df, self.harmonic_cmap)
             self.cached_field_grid = field_grid
         else:
@@ -1256,16 +1157,29 @@ class EntityDashboard:
         # Render both fields (phase+resonance, efficiency)
         physical_rgb, ethical_rgb = render_physical_field(field_grid, self.harmonic_cmap)
         
-        # Stamp the entity block directly into the RGB arrays so it occupies exactly one voxel.
-        # Color encodes motor-unlock state: coherence 0→0.7→1.0  maps to  deep red → amber → bright green.
-        if field_grid.agent_position is not None:
+        # Stamp ALL agent blocks into the RGB arrays.
+        # Each agent gets a unique tint so they're distinguishable.
+        agent_hue_offsets = [0.0, 0.55, 0.30, 0.80]  # cyan-shift for agents 1,2,3
+        h, w = physical_rgb.shape[:2]
+        for idx, ag_info in enumerate(getattr(field_grid, 'agents', [])):
+            gx = ag_info.position[0] - field_grid.x_min
+            gy = ag_info.position[1] - field_grid.y_min
+            if 0 <= gx < w and 0 <= gy < h:
+                coh = ag_info.coherence if ag_info.coherence is not None else 0.0
+                coh = max(0.0, min(1.0, coh))
+                if idx == 0:
+                    entity_color = self._coherence_to_rgb(coh)
+                else:
+                    entity_color = self._agent_color(idx, coh)
+                physical_rgb[gy, gx] = entity_color
+                ethical_rgb[gy, gx] = entity_color
+        # Fallback for old data without agents list
+        if not getattr(field_grid, 'agents', []) and field_grid.agent_position is not None:
             gx = field_grid.agent_position[0] - field_grid.x_min
             gy = field_grid.agent_position[1] - field_grid.y_min
-            h, w = physical_rgb.shape[:2]
             if 0 <= gx < w and 0 <= gy < h:
                 coh = field_grid.agent_coherence if field_grid.agent_coherence is not None else 0.0
-                coh = max(0.0, min(1.0, coh))
-                entity_color = self._coherence_to_rgb(coh)
+                entity_color = self._coherence_to_rgb(max(0.0, min(1.0, coh)))
                 physical_rgb[gy, gx] = entity_color
                 ethical_rgb[gy, gx] = entity_color
         
@@ -1305,24 +1219,56 @@ class EntityDashboard:
                 ax.text(0, 1.2, 'N', ha='center', va='center',
                        color='#666666', fontsize=8, weight='bold')
         
-        # AGE and field both use this same df (live: current run only; history: scrubber window)
+        # Update AGE and Tick displays
         if 'engine_hours' in df.columns:
             current_hours = float(df['engine_hours'].iloc[-1])
             self.engine_hours_label.config(
                 text=f"AGE: {current_hours:.4f} HOURS"
             )
-            if self.live_mode:
-                max_hours = float(df['engine_hours'].max())
-                if max_hours > 0:
-                    self.history_slider.configure(to=max_hours)
-                    self.history_var.set(max_hours)
-                    self.history_value_label.config(text=f"{max_hours:.4f} h")
+        if 'tick' in df.columns:
+            last_tick = int(df['tick'].iloc[-1])
+            self.tick_label.config(text=f"Tick: {last_tick:,}")
         
+        # Update live metrics bar
+        if df is not None and not df.empty and hasattr(self, 'metrics_labels'):
+            try:
+                if 'efficiency_momentum' in df.columns:
+                    em = float(df['efficiency_momentum'].iloc[-1])
+                    self.metrics_labels["em"].config(text=f"EM: {em:.2f}")
+
+                    em_col = df['efficiency_momentum']
+                    total = len(em_col)
+                    if total > 0:
+                        high = (em_col > 0.6).sum() / total * 100
+                        mid = ((em_col >= 0.3) & (em_col <= 0.6)).sum() / total * 100
+                        self.metrics_labels["regime"].config(
+                            text=f"HIGH {high:.0f}% MID {mid:.0f}%")
+
+                if 'energy_in' in df.columns and 'efficiency' in df.columns:
+                    interactions = df[df['energy_in'] > 0]
+                    if len(interactions) > 0:
+                        mean_eff = float(interactions['efficiency'].mean())
+                        self.metrics_labels["eff"].config(text=f"Eff: {mean_eff:.2f}")
+
+                if 'vehicle' in df.columns:
+                    total = len(df)
+                    reanchor = (df['vehicle'] == 'Reanchor').sum()
+                    engaged_pct = (1 - reanchor / total) * 100 if total > 0 else 0
+                    self.metrics_labels["observer"].config(
+                        text=f"Observer: {engaged_pct:.1f}%")
+
+                if 'agent_id' in df.columns:
+                    n_agents = df['agent_id'].nunique()
+                    self.metrics_labels["agents"].config(
+                        text=f"Agents: {n_agents}")
+            except Exception:
+                pass
+
         self.canvas.draw_idle()
         self.canvas.flush_events()
         self.root.update_idletasks()
 
-    def _draw_waiting_state(self):
+    def _draw_waiting_state(self, running: bool = False):
         """Draw placeholder when no metrics data is available yet."""
         self.ax_physical.clear()
         self.ax_ethical.clear()
@@ -1332,11 +1278,16 @@ class EntityDashboard:
         self._style_field_axis(self.ax_ethical, 'Efficiency Field')
         self._style_direction_axis(self.ax_dir_phys, 'Dir')
         self._style_direction_axis(self.ax_dir_eth, 'Dir')
-        msg = "Waiting for data... (run Initialize Entity to start)"
+        if running:
+            msg = "Running — waiting for first metrics flush... (buffer fills every N rows)"
+        else:
+            msg = "Waiting for data... (run Initialize Entity or Resume to start)"
         for ax in [self.ax_physical, self.ax_ethical]:
             ax.text(0.5, 0.5, msg, transform=ax.transAxes,
                    ha='center', va='center', fontsize=14, color=self.fg_color)
         self.engine_hours_label.config(text="AGE: -- HOURS")
+        if hasattr(self, 'tick_label'):
+            self.tick_label.config(text="Tick: --")
         if hasattr(self, 'cached_field_grid'):
             delattr(self, 'cached_field_grid')
         self.canvas.draw_idle()

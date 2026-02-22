@@ -12,7 +12,7 @@
 //! Strength: Prevents cruelty
 //! Blind spot: Can rationalize self-erasure if isolated (putting others first always)
 
-use super::{Vehicle, VehicleType, Perspective, MemoryContext};
+use super::{Vehicle, VehicleType, Perspective, MemoryContext, EnvironmentContext};
 use crate::cognition::triune::TriuneResult;
 use crate::motor::Modality;
 
@@ -81,43 +81,62 @@ impl Vehicle for ComplementVehicle {
         VehicleType::Complement
     }
 
-    fn interpret(&self, triune: &TriuneResult, memory_context: Option<&MemoryContext>) -> Perspective {
-        let emotional_intent = self.assess_emotional_intent(triune);
-        let mut confidence = self.assess_confidence(triune);
-        
-        // Memory context affects confidence
+    fn interpret(
+        &self,
+        triune: &TriuneResult,
+        memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
+    ) -> Perspective {
+        let env = match env_context {
+            Some(e) => e,
+            None => return Perspective::empty(VehicleType::Complement),
+        };
+
+        // Emotional intent: which direction has felt best? Use recent efficiency by quadrant.
+        let mut quadrant_scores = [0.5f32; 4];
+        for q in 0..4 {
+            if let Some(eff) = env.quadrant_recent_efficiency[q] {
+                quadrant_scores[q] = (eff / 2.0).max(0.0).min(1.0);
+            }
+        }
+
+        let best_q = quadrant_scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0) as u8;
+        let emotional_intent = quadrant_scores[best_q as usize];
+
+        let mut confidence = triune.experiential.signal_strength;
         if let Some(ctx) = memory_context {
-            // Past positive outcomes increase confidence in positive readings
             if emotional_intent > self.positive_threshold && ctx.past_outcome_valence > 0.6 {
                 confidence = (confidence + 0.1).min(1.0);
             }
-            // Past negative outcomes increase confidence in negative readings
             if emotional_intent < self.positive_threshold && ctx.past_outcome_valence < 0.4 {
                 confidence = (confidence + 0.1).min(1.0);
             }
         }
-        
-        // Determine modality hint based on emotional intent
-        let modality_hint = if emotional_intent > 0.7 {
-            // Strong positive -> engage
+
+        let modality_hint = if emotional_intent > 0.6 {
             Some(Modality::Movement)
-        } else if emotional_intent < 0.3 {
-            // Strong negative -> withdraw/rest
-            Some(Modality::Rest)
         } else {
-            // Uncertain -> listen more (ears for social cues)
-            Some(Modality::Ears)
+            Some(Modality::Rest)
         };
-        
+
         Perspective {
             vehicle_type: VehicleType::Complement,
-            structural_truth: None,  // Not our domain
+            structural_truth: None,
             emotional_intent: Some(emotional_intent),
             identity_alignment: None,
             possibility_space: None,
             modality_hint,
+            recommended_quadrant: Some(best_q),
             confidence,
-            interpretation: self.generate_interpretation(emotional_intent, triune),
+            interpretation: format!(
+                "Felt sense: Q{} has felt best (score={:.2})",
+                best_q, quadrant_scores[best_q as usize]
+            ),
         }
     }
 }

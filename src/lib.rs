@@ -32,7 +32,7 @@ pub use cognition::{
     AttentionField, StimulusContext, MemoryEcho, StimulusRelation, RelationType,
     TriuneProcessor, TriuneResult, AnalyticalMind, AnalyticalAssessment, 
     ExperientialHeart, ExperientialAssessment,
-    VehicleSystem, VehicleType, Perspective, VehicleAlignment, MemoryContext,
+    VehicleSystem, VehicleType, Perspective, VehicleAlignment, MemoryContext, EnvironmentContext,
     MemoryGraph, MemoryNode, MemorySignature, ResonanceLink, ResonanceType, ConsentResult,
     WitnessOutcome, ObserverState, Question, PresenceEvent, CognitiveState,
     // Sanctuary (4D Scalar Field Environment with Dual-Stream Persistence)

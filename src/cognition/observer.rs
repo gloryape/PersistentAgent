@@ -18,7 +18,7 @@ use crate::motor::{MotorImpulse, Modality};
 use crate::cognition::attention_field::{AttentionField, StimulusContext};
 use crate::cognition::memory_graph::MemoryGraph;
 use crate::cognition::triune::{TriuneProcessor, TriuneResult};
-use crate::cognition::vehicles::{VehicleSystem, VehicleType, VehicleAlignment};
+use crate::cognition::vehicles::{VehicleSystem, VehicleType, VehicleAlignment, EnvironmentContext};
 
 /// Constants for Observer behavior
 pub const ACTION_THRESHOLD: f32 = 0.7;     // Inevitability threshold for action
@@ -125,21 +125,21 @@ impl ObserverState {
         self.coherence = triune.coherence;
         self.resonance = triune.experiential.resonance;
         
-        // Calculate inhibition from dissonance and conflicts
-        self.inhibition = triune.dissonance * 0.5;
+        let mut base_inhibition = triune.dissonance * 0.5;
         
         if let Some(align) = alignment {
-            // Disagreement increases inhibition
+            // Vehicle consensus REDUCES inhibition — they processed the dissonance.
+            // High alignment means the dissonance has been interpreted and resolved.
+            let resolution_factor = align.alignment_score;
+            base_inhibition *= 1.0 - resolution_factor * 0.7;
+            
+            // Genuine disagreement still adds inhibition
             if !align.dissenting.is_empty() {
-                self.inhibition += 0.2 * align.dissenting.len() as f32;
-            }
-            // Low alignment increases inhibition
-            if align.alignment_score < 0.5 {
-                self.inhibition += 0.2 * (1.0 - align.alignment_score);
+                base_inhibition += 0.1 * align.dissenting.len() as f32;
             }
         }
         
-        self.inhibition = self.inhibition.min(1.0);
+        self.inhibition = base_inhibition.min(1.0);
         
         // Calculate readiness
         // Readiness = coherence * resonance * (1 + alignment_boost) - inhibition
@@ -160,13 +160,18 @@ impl ObserverState {
         self.last_readiness = self.readiness;
     }
 
-    /// Check if action is inevitable (threshold crossed)
-    pub fn is_inevitable(&self) -> bool {
+    /// Check if action is inevitable (threshold crossed).
+    /// Stimulus intensity (max_novelty) modulates threshold: as novelty approaches 1.0,
+    /// the organism cannot ignore the unknown and action becomes inevitable.
+    /// Math: effective_threshold = BASE_THRESHOLD * (1.0 - max_novelty)
+    pub fn is_inevitable(&self, max_novelty: f32) -> bool {
+        let novelty = max_novelty.clamp(0.0, 1.0);
+        let effective_threshold = ACTION_THRESHOLD * (1.0 - novelty);
         // Hysteresis: once crossed, stay crossed until much lower
         if self.crossed_threshold {
-            self.readiness > ACTION_THRESHOLD - HYSTERESIS
+            self.readiness > effective_threshold - HYSTERESIS
         } else {
-            self.readiness > ACTION_THRESHOLD
+            self.readiness > effective_threshold
         }
     }
 
@@ -174,30 +179,48 @@ impl ObserverState {
     pub fn crystallize_impulse(&self, context: &StimulusContext) -> MotorImpulse {
         use crate::cognition::stimuli::StimulusSource;
         
-        // Determine modality from context and alignment
         let modality = if let Some(ref align) = self.pending_alignment {
             align.suggested_modality.unwrap_or(Modality::Eyes)
         } else {
             match &context.raw.source {
                 StimulusSource::VisualRegion { .. } => Modality::Eyes,
                 StimulusSource::AudioStream { .. } => Modality::Ears,
+                StimulusSource::Proprioceptive { .. } => Modality::Eyes,
                 StimulusSource::Internal { .. } => Modality::Rest,
             }
         };
         
-        // Calculate direction from context
-        let direction = match &context.raw.source {
+        let direction = if let Some(ref align) = self.pending_alignment {
+            if let Some(dir) = align.recommended_direction {
+                dir
+            } else {
+                self.default_direction(context)
+            }
+        } else {
+            self.default_direction(context)
+        };
+        
+        MotorImpulse::new(direction, self.readiness, modality)
+    }
+
+    /// Default direction when vehicles have no recommendation (e.g. from stimulus source)
+    fn default_direction(&self, context: &StimulusContext) -> (i32, i32) {
+        use crate::cognition::stimuli::StimulusSource;
+        match &context.raw.source {
             StimulusSource::VisualRegion { rect, .. } => {
                 let center = rect.center();
                 (center.0 as i32, center.1 as i32)
             }
-            StimulusSource::AudioStream { frequency, .. } => {
-                (*frequency as i32, 0)
-            }
+            StimulusSource::AudioStream { frequency, .. } => (*frequency as i32, 0),
+            StimulusSource::Proprioceptive { brightest_quadrant, .. } => match brightest_quadrant {
+                0 => (-1, -1),
+                1 => (1, -1),
+                2 => (-1, 1),
+                3 => (1, 1),
+                _ => (0, 0),
+            },
             _ => (0, 0),
-        };
-        
-        MotorImpulse::new(direction, self.readiness, modality)
+        }
     }
 
     /// Reset after action (refractory period)
@@ -225,7 +248,7 @@ impl Default for ObserverState {
 pub struct CognitiveState {
     /// Recent witness outcomes
     pub recent_outcomes: Vec<WitnessOutcome>,
-    /// Number of vehicle consultations this cycle
+    /// Number of vehicle consultations this input cycle
     pub vehicle_consultations: u32,
     /// Whether we've had new external input
     pub has_new_input: bool,
@@ -233,6 +256,10 @@ pub struct CognitiveState {
     pub internal_depth: u32,
     /// Explorer activations without new input
     pub explorer_activations: u32,
+    /// Ticks since vehicles were first consulted this cycle
+    pub ticks_since_consultation: u32,
+    /// Whether vehicles have been consulted at least once this cycle
+    pub vehicles_active: bool,
 }
 
 impl CognitiveState {
@@ -243,6 +270,8 @@ impl CognitiveState {
             has_new_input: true,
             internal_depth: 0,
             explorer_activations: 0,
+            ticks_since_consultation: 0,
+            vehicles_active: false,
         }
     }
 
@@ -250,13 +279,33 @@ impl CognitiveState {
         self.has_new_input = true;
         self.internal_depth = 0;
         self.explorer_activations = 0;
+        self.vehicle_consultations = 0;
+        self.vehicles_active = false;
+        self.ticks_since_consultation = 0;
     }
 
     pub fn record_outcome(&mut self, outcome: WitnessOutcome) {
+        let is_needs_perspective = matches!(outcome, WitnessOutcome::NeedsPerspective(_));
+        
         self.recent_outcomes.push(outcome);
         if self.recent_outcomes.len() > 10 {
             self.recent_outcomes.remove(0);
         }
+        
+        // Track consultation window
+        if is_needs_perspective {
+            if !self.vehicles_active {
+                self.vehicles_active = true;
+                self.ticks_since_consultation = 0;
+            } else {
+                self.ticks_since_consultation += 1;
+            }
+        } else {
+            self.vehicles_active = false;
+            self.ticks_since_consultation = 0;
+        }
+        
+        self.has_new_input = false;
     }
 }
 
@@ -350,6 +399,8 @@ impl Observer {
         triune: &mut TriuneProcessor,
         vehicles: &VehicleSystem,
         memory: &MemoryGraph,
+        env_context: Option<&EnvironmentContext>,
+        _efficiency: f32,  // retained for API compatibility; inevitability now uses stimulus (novelty)
     ) -> Option<MotorImpulse> {
         // Record focus
         self.state.current_focus = Some(target.raw.id);
@@ -365,7 +416,7 @@ impl Observer {
         );
         
         // 2. Classify outcome
-        let outcome = self.witness(&triune_result, vehicles, memory, target);
+        let outcome = self.witness(&triune_result, vehicles, memory, target, env_context);
         self.last_outcome = Some(outcome.clone());
         self.cognitive_state.record_outcome(outcome.clone());
         
@@ -382,7 +433,7 @@ impl Observer {
                 // Consult vehicles and try again
                 self.cognitive_state.vehicle_consultations += 1;
                 let memory_context = memory.get_memory_context(target);
-                let alignment = vehicles.converge(&vehicle_types, &triune_result, Some(&memory_context));
+                let alignment = vehicles.converge(&vehicle_types, &triune_result, Some(&memory_context), env_context);
                 
                 log::debug!(
                     "[OBSERVER] Consulted {} vehicles, alignment={:.2}",
@@ -394,8 +445,11 @@ impl Observer {
                 self.state.pending_alignment = Some(alignment.clone());
                 self.state.update_dynamics(&triune_result, Some(&alignment));
                 
-                // Check if now inevitable
-                if self.state.is_inevitable() {
+                // Check if now inevitable (stimulus intensity: high novelty forces action)
+                let max_novelty = env_context
+                    .map(|e| e.quadrant_novelty.iter().cloned().fold(0.0f32, f32::max))
+                    .unwrap_or(0.0);
+                if self.state.is_inevitable(max_novelty) {
                     let impulse = self.state.crystallize_impulse(target);
                     self.state.reset_after_fire();
                     log::info!("[OBSERVER] Action emerged after vehicle consultation: {:?}", impulse.modality);
@@ -418,80 +472,50 @@ impl Observer {
         }
     }
 
-    /// Witness: Classify the cognitive state
+    /// Witness: Classify using physical field metrics only (thermodynamic phase transitions).
+    /// Vehicle selection is decoupled from triune.has_dissonance(); runs unconditionally when env_context available.
     fn witness(
         &mut self,
         triune: &TriuneResult,
         vehicles: &VehicleSystem,
         memory: &MemoryGraph,
-        context: &StimulusContext,
+        _context: &StimulusContext,
+        env_context: Option<&EnvironmentContext>,
     ) -> WitnessOutcome {
-        // First check presence
         let presence = self.check_presence();
         if let PresenceEvent::ReanchorNow = presence {
             return WitnessOutcome::ReanchorPresence;
         }
         if let PresenceEvent::GateExplorer = presence {
-            // Don't allow Explorer vehicle
             self.cognitive_state.explorer_activations = 0;
         }
-        
-        // Check for dissonance
-        if triune.has_dissonance() {
-            // Determine which vehicles to consult
-            let needed_vehicles = vehicles.select_vehicles_for_dissonance(triune);
-            
-            // Gate Explorer if needed
-            let gated_vehicles: Vec<VehicleType> = if let PresenceEvent::GateExplorer = presence {
-                needed_vehicles.into_iter()
-                    .filter(|v| *v != VehicleType::Explorer)
-                    .collect()
-            } else {
-                // Track Explorer activation
-                if needed_vehicles.contains(&VehicleType::Explorer) {
-                    self.cognitive_state.explorer_activations += 1;
-                }
-                needed_vehicles
-            };
-            
-            if gated_vehicles.is_empty() {
-                // No vehicles to consult, this is a mystery
-                return WitnessOutcome::DeepMystery(Question {
-                    stimulus_id: context.raw.id,
-                    nature: format!(
-                        "Dissonance without resolution: coherence={:.2}, dissonance={:.2}",
-                        triune.coherence, triune.dissonance
-                    ),
-                    timestamp: Instant::now(),
-                });
+
+        // No physical data -> stand still until efficiency drops and Explorer triggers
+        let env = match env_context {
+            Some(e) => e,
+            None => return WitnessOutcome::ReanchorPresence,
+        };
+
+        // Physics-based selection (thermodynamic phase boundaries)
+        let needed_vehicles = vehicles.select_vehicles(triune, Some(env), memory);
+
+        let gated_vehicles: Vec<VehicleType> = if let PresenceEvent::GateExplorer = presence {
+            needed_vehicles
+                .into_iter()
+                .filter(|v| *v != VehicleType::Explorer)
+                .collect()
+        } else {
+            if needed_vehicles.contains(&VehicleType::Explorer) {
+                self.cognitive_state.explorer_activations += 1;
             }
-            
-            return WitnessOutcome::NeedsPerspective(gated_vehicles);
+            needed_vehicles
+        };
+
+        if gated_vehicles.is_empty() {
+            return WitnessOutcome::ReanchorPresence;
         }
-        
-        // No dissonance - check if ready for action
-        let memory_context = memory.get_memory_context(context);
-        self.state.update_dynamics(triune, None);
-        
-        // If coherent and ready, action emerges
-        if triune.coherence > 0.6 && self.state.is_inevitable() {
-            let impulse = self.state.crystallize_impulse(context);
-            return WitnessOutcome::Coherent(impulse);
-        }
-        
-        // Check for deep mystery (high signal but can't converge)
-        if triune.analytical.signal_strength > 0.5 && triune.experiential.signal_strength > 0.5 {
-            if self.state.is_stagnant() {
-                return WitnessOutcome::DeepMystery(Question {
-                    stimulus_id: context.raw.id,
-                    nature: "Stagnant attention without convergence".to_string(),
-                    timestamp: Instant::now(),
-                });
-            }
-        }
-        
-        // Still building readiness - need more perspectives
-        WitnessOutcome::NeedsPerspective(vec![VehicleType::Saitama, VehicleType::Complement])
+
+        WitnessOutcome::NeedsPerspective(gated_vehicles)
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -512,27 +536,19 @@ impl Observer {
             return PresenceEvent::GateExplorer;
         }
         
-        // Check for too many vehicle consultations without resolution
+        // Vehicle consultation window: allow 3 ticks for readiness to build.
+        // Only reanchor if vehicles have been active for too long without resolution.
+        if self.cognitive_state.vehicles_active && self.cognitive_state.ticks_since_consultation > 3 {
+            log::warn!("[PRESENCE] Reanchor: Vehicle consultation exceeded window ({} ticks)",
+                self.cognitive_state.ticks_since_consultation);
+            return PresenceEvent::ReanchorNow;
+        }
+        
+        // Too many individual consultations within one input cycle
         if self.cognitive_state.vehicle_consultations >= 5 && !self.cognitive_state.has_new_input {
             log::warn!("[PRESENCE] Reanchor: {} consultations without new input",
                 self.cognitive_state.vehicle_consultations);
             return PresenceEvent::ReanchorNow;
-        }
-        
-        // Check for outcome repetition
-        if self.cognitive_state.recent_outcomes.len() >= 3 {
-            let recent = &self.cognitive_state.recent_outcomes;
-            let last_3: Vec<_> = recent.iter().rev().take(3).collect();
-            
-            // Check if all three are NeedsPerspective with same vehicles
-            let all_need_perspective = last_3.iter().all(|o| {
-                matches!(o, WitnessOutcome::NeedsPerspective(_))
-            });
-            
-            if all_need_perspective {
-                log::warn!("[PRESENCE] Reanchor: Repeated NeedsPerspective without resolution");
-                return PresenceEvent::ReanchorNow;
-            }
         }
         
         // Check for high internal depth without progress
@@ -593,6 +609,14 @@ impl Observer {
         }
 
         if let StimulusSource::Internal { .. } = &target.source {
+            queue.mark_attended(target_id);
+            self.current_attention = Some(target_id);
+            return Some(Action::Rest);
+        }
+
+        if let StimulusSource::Proprioceptive { .. } = &target.source {
+            // Legacy path: treat proprioceptive like internal (rest).
+            // The real processing happens through the witness() pipeline.
             queue.mark_attended(target_id);
             self.current_attention = Some(target_id);
             return Some(Action::Rest);

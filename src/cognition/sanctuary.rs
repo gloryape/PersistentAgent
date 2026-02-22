@@ -83,6 +83,284 @@ pub const LOGS_BUFFER_SIZE: usize = 100;
 pub const DEFAULT_DATA_DIR: &str = "data";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TERRAIN: Vacuum Geometry (background field structure)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Vacuum geometry — the background field structure.
+/// Returns (amplitude, phase) at any coordinate.
+/// This is the equilibrium state the field decays TOWARD, not away from.
+pub trait TerrainFunction: Send + Sync {
+    /// Returns (physical_amplitude, phase) at this point.
+    /// Physical amplitude includes energy from phase winding: ρ₀ + α|∇θ|².
+    /// Used for stiffness calculation (Exclusion Axiom).
+    fn sample(&self, x: i32, y: i32) -> (f32, f32);
+
+    /// Returns the luminance (perceivable brightness) at this point.
+    /// The vacuum glows at ρ₀. Phase winding absorbs luminance — material is dark.
+    /// luminance = max(0, ρ₀ − α|∇θ|²)
+    /// Default: returns the sample amplitude (no winding absorption).
+    fn luminance(&self, x: i32, y: i32) -> f32 {
+        self.sample(x, y).0
+    }
+
+    fn name(&self) -> &str;
+}
+
+/// Flat vacuum — uniform amplitude and phase everywhere.
+pub struct FlatVacuum {
+    pub rho_0: f32,
+    pub theta_0: f32,
+}
+
+impl TerrainFunction for FlatVacuum {
+    fn sample(&self, _x: i32, _y: i32) -> (f32, f32) {
+        (self.rho_0, self.theta_0)
+    }
+    fn name(&self) -> &str { "flat" }
+}
+
+/// Phase gradient — linear phase variation across the field.
+/// Creates a "current" the organism can swim with or against.
+pub struct PhaseGradient {
+    pub rho_0: f32,
+    pub kx: f32,
+    pub ky: f32,
+    pub theta_0: f32,
+}
+
+impl TerrainFunction for PhaseGradient {
+    fn sample(&self, x: i32, y: i32) -> (f32, f32) {
+        let theta = (self.theta_0 + self.kx * x as f32 + self.ky * y as f32)
+            .rem_euclid(2.0 * std::f32::consts::PI);
+        (self.rho_0, theta)
+    }
+    fn name(&self) -> &str { "gradient" }
+}
+
+/// A domain wall: a line segment where the phase transitions by delta_theta.
+/// The wall creates material through phase winding — amplitude is derived
+/// from |grad_theta|^2, not placed arbitrarily.
+pub struct DomainWall {
+    pub x1: f32, pub y1: f32,
+    pub x2: f32, pub y2: f32,
+    pub delta_theta: f32,
+    pub width: f32,
+}
+
+impl DomainWall {
+    fn signed_distance(&self, px: f32, py: f32) -> f32 {
+        let dx = self.x2 - self.x1;
+        let dy = self.y2 - self.y1;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq < 0.001 {
+            return ((px - self.x1).powi(2) + (py - self.y1).powi(2)).sqrt();
+        }
+        let t = ((px - self.x1) * dx + (py - self.y1) * dy) / len_sq;
+        if t < 0.0 || t > 1.0 {
+            return 100.0;
+        }
+        let cross = (px - self.x1) * dy - (py - self.y1) * dx;
+        cross / len_sq.sqrt()
+    }
+
+    fn phase_at(&self, px: f32, py: f32) -> f32 {
+        let d = self.signed_distance(px, py);
+        let sigmoid = 1.0 / (1.0 + (-d / self.width).exp());
+        self.delta_theta * sigmoid
+    }
+
+    fn grad_sq(&self, px: f32, py: f32) -> f32 {
+        let d = self.signed_distance(px, py);
+        let sigmoid = 1.0 / (1.0 + (-d / self.width).exp());
+        let dsig_dd = sigmoid * (1.0 - sigmoid) / self.width;
+        let grad_mag = self.delta_theta * dsig_dd;
+        grad_mag * grad_mag
+    }
+}
+
+/// Domain maze: phase domain boundaries create material walls.
+/// Inside each domain, phase is locally uniform (easy to navigate).
+/// At boundaries, phase changes rapidly -> high |grad_theta| -> high rho -> high stiffness.
+pub struct DomainMaze {
+    pub rho_0: f32,
+    pub theta_base: f32,
+    pub alpha: f32,
+    pub walls: Vec<DomainWall>,
+}
+
+impl TerrainFunction for DomainMaze {
+    fn sample(&self, x: i32, y: i32) -> (f32, f32) {
+        let px = x as f32;
+        let py = y as f32;
+
+        let mut theta = self.theta_base;
+        let mut total_grad_sq = 0.0_f32;
+
+        for wall in &self.walls {
+            theta += wall.phase_at(px, py);
+            total_grad_sq += wall.grad_sq(px, py);
+        }
+
+        let rho = self.rho_0 + self.alpha * total_grad_sq;
+        let theta = theta.rem_euclid(2.0 * std::f32::consts::PI);
+
+        (rho, theta)
+    }
+
+    fn luminance(&self, x: i32, y: i32) -> f32 {
+        let px = x as f32;
+        let py = y as f32;
+        let mut total_grad_sq = 0.0_f32;
+        for wall in &self.walls {
+            total_grad_sq += wall.grad_sq(px, py);
+        }
+        (self.rho_0 - self.alpha * total_grad_sq).max(0.0)
+    }
+
+    fn name(&self) -> &str { "domain_maze" }
+}
+
+/// A phase vortex: topological point defect where theta = n * atan2(dy, dx).
+/// At the core, |grad_theta| -> infinity as 1/r, creating geodesically
+/// inaccessible points (the Exclusion Axiom manifests directly).
+pub struct Vortex {
+    pub cx: f32,
+    pub cy: f32,
+    pub winding: i32,
+    pub core_radius: f32,
+}
+
+/// Vortex field: material from topological point defects.
+pub struct VortexField {
+    pub rho_0: f32,
+    pub theta_base: f32,
+    pub alpha: f32,
+    pub vortices: Vec<Vortex>,
+}
+
+impl TerrainFunction for VortexField {
+    fn sample(&self, x: i32, y: i32) -> (f32, f32) {
+        let px = x as f32;
+        let py = y as f32;
+
+        let mut theta = self.theta_base;
+        let mut total_grad_sq = 0.0_f32;
+
+        for v in &self.vortices {
+            let dx = px - v.cx;
+            let dy = py - v.cy;
+            let r_sq = dx * dx + dy * dy;
+            let r_sq_reg = r_sq + v.core_radius * v.core_radius;
+
+            theta += v.winding as f32 * dy.atan2(dx);
+            total_grad_sq += (v.winding as f32).powi(2) / r_sq_reg;
+        }
+
+        let rho = self.rho_0 + self.alpha * total_grad_sq;
+        let theta = theta.rem_euclid(2.0 * std::f32::consts::PI);
+
+        (rho, theta)
+    }
+
+    fn luminance(&self, x: i32, y: i32) -> f32 {
+        let px = x as f32;
+        let py = y as f32;
+        let mut total_grad_sq = 0.0_f32;
+        for v in &self.vortices {
+            let dx = px - v.cx;
+            let dy = py - v.cy;
+            let r_sq = dx * dx + dy * dy;
+            let r_sq_reg = r_sq + v.core_radius * v.core_radius;
+            total_grad_sq += (v.winding as f32).powi(2) / r_sq_reg;
+        }
+        (self.rho_0 - self.alpha * total_grad_sq).max(0.0)
+    }
+
+    fn name(&self) -> &str { "vortex_field" }
+}
+
+/// Checkerboard of phase domains creating a regular maze.
+/// In each "cell", the phase is uniform. At cell boundaries,
+/// the phase transitions -> material wall forms from the winding.
+pub struct CheckerboardDomains {
+    pub rho_0: f32,
+    pub theta_base: f32,
+    pub delta_theta: f32,
+    pub cell_size: f32,
+    pub wall_width: f32,
+    pub alpha: f32,
+}
+
+impl TerrainFunction for CheckerboardDomains {
+    fn sample(&self, x: i32, y: i32) -> (f32, f32) {
+        let px = x as f32;
+        let py = y as f32;
+
+        let kx = std::f32::consts::PI / self.cell_size;
+        let ky = std::f32::consts::PI / self.cell_size;
+
+        let sharpness = self.cell_size / (2.0 * self.wall_width);
+        let domain_x = ((kx * px).sin() * sharpness).tanh();
+        let domain_y = ((ky * py).sin() * sharpness).tanh();
+
+        let domain_signal = domain_x * domain_y;
+        let theta = self.theta_base + self.delta_theta * 0.5 * (1.0 + domain_signal);
+
+        let sin_kx = (kx * px).sin();
+        let cos_kx = (kx * px).cos();
+        let tanh_x = (sin_kx * sharpness).tanh();
+        let sech2_x = 1.0 - tanh_x * tanh_x;
+        let d_domx_dx = kx * cos_kx * sharpness * sech2_x;
+
+        let sin_ky = (ky * py).sin();
+        let cos_ky = (ky * py).cos();
+        let tanh_y = (sin_ky * sharpness).tanh();
+        let sech2_y = 1.0 - tanh_y * tanh_y;
+        let d_domy_dy = ky * cos_ky * sharpness * sech2_y;
+
+        let dtheta_dx = self.delta_theta * 0.5 * domain_y * d_domx_dx;
+        let dtheta_dy = self.delta_theta * 0.5 * domain_x * d_domy_dy;
+        let grad_sq = dtheta_dx * dtheta_dx + dtheta_dy * dtheta_dy;
+
+        let rho = self.rho_0 + self.alpha * grad_sq;
+        let theta = theta.rem_euclid(2.0 * std::f32::consts::PI);
+
+        (rho, theta)
+    }
+
+    fn luminance(&self, x: i32, y: i32) -> f32 {
+        let px = x as f32;
+        let py = y as f32;
+
+        let kx = std::f32::consts::PI / self.cell_size;
+        let ky = std::f32::consts::PI / self.cell_size;
+        let sharpness = self.cell_size / (2.0 * self.wall_width);
+
+        let sin_kx = (kx * px).sin();
+        let cos_kx = (kx * px).cos();
+        let tanh_x = (sin_kx * sharpness).tanh();
+        let sech2_x = 1.0 - tanh_x * tanh_x;
+        let d_domx_dx = kx * cos_kx * sharpness * sech2_x;
+
+        let sin_ky = (ky * py).sin();
+        let cos_ky = (ky * py).cos();
+        let tanh_y = (sin_ky * sharpness).tanh();
+        let sech2_y = 1.0 - tanh_y * tanh_y;
+        let d_domy_dy = ky * cos_ky * sharpness * sech2_y;
+
+        let domain_x = tanh_x;
+        let domain_y = tanh_y;
+        let dtheta_dx = self.delta_theta * 0.5 * domain_y * d_domx_dx;
+        let dtheta_dy = self.delta_theta * 0.5 * domain_x * d_domy_dy;
+        let grad_sq = dtheta_dx * dtheta_dx + dtheta_dy * dtheta_dy;
+
+        (self.rho_0 - self.alpha * grad_sq).max(0.0)
+    }
+
+    fn name(&self) -> &str { "checkerboard" }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DATA STRUCTURES: Field Physics
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -275,6 +553,10 @@ pub struct MetricRecord {
     pub engine_hours: f64,
     /// Metabolic coherence (0.0–1.0). Motor unlocked when >= 0.7.
     pub coherence: f64,
+    /// Somatic motor state: efficiency momentum (continuous coupling to field feedback).
+    pub efficiency_momentum: f32,
+    /// Motor regime label (legacy compat: "somatic" in new runs).
+    pub motor_regime: String,
 }
 
 /// Stream B: Agent conscious thought/state changes (JSONL)
@@ -313,8 +595,12 @@ pub struct SanctuaryMetrics {
 
 /// The Sanctuary - A 4D Scalar Field with Causal Memory and Data Persistence
 pub struct Sanctuary {
+    // === Vacuum Geometry ===
+    /// Background field structure (None = legacy flat vacuum at zero)
+    terrain: Option<Box<dyn TerrainFunction>>,
+
     // === Field State ===
-    /// Sparse voxel grid (only stores non-empty voxels)
+    /// Sparse voxel grid (only stores non-empty voxels — excitations above terrain)
     field: HashMap<(i32, i32, i32), Voxel>,
     /// Current simulation tick
     tick: u64,
@@ -359,6 +645,10 @@ pub struct Sanctuary {
     /// Instant of the last tick (for calculating delta_time)
     last_tick_instant: Option<Instant>,
 
+    // === Motor regime (for metrics) ===
+    /// Motor state set by main each tick: (efficiency_momentum, motor_regime). Used when logging interactions.
+    motor_state: Option<(f32, String)>,
+
     // === Legacy (for backwards compatibility) ===
     /// In-memory metrics history (limited)
     metrics_history: Vec<SanctuaryMetrics>,
@@ -370,6 +660,7 @@ impl Sanctuary {
     /// Create a new Sanctuary without persistence
     pub fn new() -> Self {
         Self {
+            terrain: None,
             field: HashMap::new(),
             tick: 0,
             interaction_count: 0,
@@ -387,6 +678,7 @@ impl Sanctuary {
             agent_position: (0, 0, 0),
             total_runtime: Duration::ZERO,
             last_tick_instant: None,
+            motor_state: None,
             metrics_history: Vec::new(),
             max_metrics_history: 10000,
         }
@@ -405,6 +697,7 @@ impl Sanctuary {
         log::info!("   Logs buffer: {} records", LOGS_BUFFER_SIZE);
 
         Ok(Self {
+            terrain: None,
             field: HashMap::new(),
             tick: 0,
             interaction_count: 0,
@@ -422,6 +715,7 @@ impl Sanctuary {
             agent_position: (0, 0, 0),
             total_runtime: Duration::ZERO,
             last_tick_instant: None,
+            motor_state: None,
             metrics_history: Vec::new(),
             max_metrics_history: 10000,
         })
@@ -436,6 +730,7 @@ impl Sanctuary {
         log::info!("🏛️ Sanctuary initialized with persistence at {}", data_dir.display());
 
         Ok(Self {
+            terrain: None,
             field: HashMap::new(),
             tick: 0,
             interaction_count: 0,
@@ -453,6 +748,7 @@ impl Sanctuary {
             agent_position: (0, 0, 0),
             total_runtime: Duration::ZERO,
             last_tick_instant: None,
+            motor_state: None,
             metrics_history: Vec::new(),
             max_metrics_history: 10000,
         })
@@ -462,6 +758,28 @@ impl Sanctuary {
     #[deprecated(note = "Use with_persistence() instead")]
     pub fn with_logging<P: AsRef<Path>>(_path: P) -> std::io::Result<Self> {
         Self::with_persistence()
+    }
+
+    /// Set the vacuum geometry (background field structure).
+    /// Must be called after construction, before the main loop.
+    pub fn set_terrain(&mut self, terrain: Box<dyn TerrainFunction>) {
+        log::info!("Terrain set: {}", terrain.name());
+        self.terrain = Some(terrain);
+    }
+
+    /// Get the vacuum (terrain) state at a point.
+    /// Returns (amplitude, phase). Falls back to (0, 0) if no terrain is set.
+    pub fn terrain_at(&self, x: i32, y: i32) -> (f32, f32) {
+        match &self.terrain {
+            Some(t) => t.sample(x, y),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// Set motor state for this tick (efficiency momentum and regime label). Main calls this at start of tick
+    /// so interaction rows logged during the tick carry the somatic state that led to the move.
+    pub fn set_motor_state(&mut self, efficiency_momentum: f32, motor_regime: &str) {
+        self.motor_state = Some((efficiency_momentum, motor_regime.to_string()));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -537,6 +855,8 @@ impl Sanctuary {
         let location_zs: Vec<i32> = self.metrics_buffer.iter().map(|r| r.location_z).collect();
         let engine_hours_vec: Vec<f64> = self.metrics_buffer.iter().map(|r| r.engine_hours).collect();
         let coherences: Vec<f64> = self.metrics_buffer.iter().map(|r| r.coherence).collect();
+        let eff_momentums: Vec<f32> = self.metrics_buffer.iter().map(|r| r.efficiency_momentum).collect();
+        let motor_regimes: Vec<&str> = self.metrics_buffer.iter().map(|r| r.motor_regime.as_str()).collect();
 
         // Create DataFrame
         let mut df = DataFrame::new(vec![
@@ -558,6 +878,8 @@ impl Sanctuary {
             Series::new("location_z", location_zs),
             Series::new("engine_hours", engine_hours_vec),
             Series::new("coherence", coherences),
+            Series::new("efficiency_momentum", eff_momentums),
+            Series::new("motor_regime", motor_regimes),
         ])?;
 
         // Generate filename
@@ -619,6 +941,7 @@ impl Sanctuary {
         }
 
         let engine_hours = self.total_runtime.as_secs_f64() / 3600.0;
+        let (eff_acc, regime) = self.motor_state.clone().unwrap_or((0.0, "unknown".to_string()));
 
         let record = MetricRecord {
             tick: self.tick,
@@ -639,6 +962,8 @@ impl Sanctuary {
             location_z,
             engine_hours,
             coherence,
+            efficiency_momentum: eff_acc,
+            motor_regime: regime,
         };
 
         self.metrics_buffer.push(record);
@@ -653,7 +978,15 @@ impl Sanctuary {
     /// Record a single tick sample (position + engine hours + actual field state) so the dashboard
     /// always has data to display, even when there are no motor interactions.
     /// This reads the actual field state at the agent's position (not simulated).
-    pub fn record_tick_sample(&mut self, location_x: i32, location_y: i32, coherence: f64) {
+    pub fn record_tick_sample(
+        &mut self,
+        location_x: i32,
+        location_y: i32,
+        coherence: f64,
+        efficiency_momentum: f32,
+        motor_regime: &str,
+        vehicle: &str,
+    ) {
         if !self.persistence_enabled {
             return;
         }
@@ -676,7 +1009,7 @@ impl Sanctuary {
             tick: self.tick,
             timestamp_ms: Utc::now().timestamp_millis(),
             agent_id: self.agent_id.clone(),
-            vehicle: self.current_vehicle.clone(),
+            vehicle: vehicle.to_string(),
             phase,
             stiffness,
             resonance,
@@ -691,6 +1024,8 @@ impl Sanctuary {
             location_z: 0,
             engine_hours,
             coherence,
+            efficiency_momentum,
+            motor_regime: motor_regime.to_string(),
         };
         self.metrics_buffer.push(record);
         if self.metrics_buffer.len() >= METRICS_BUFFER_SIZE {
@@ -851,6 +1186,11 @@ impl Sanctuary {
         self.tick
     }
 
+    /// Set the current tick (for tests: advance past preparation phase)
+    pub fn set_tick(&mut self, t: u64) {
+        self.tick = t;
+    }
+
     /// Get or create a voxel at the given coordinates
     fn get_or_create_voxel(&mut self, coords: (i32, i32, i32)) -> &mut Voxel {
         self.field.entry(coords).or_insert_with(Voxel::new)
@@ -878,7 +1218,7 @@ impl Sanctuary {
     /// 3. The deformation will naturally interact with the Memory Kernel on the next tick
     ///
     /// # Example
-    /// ```rust
+    /// ```rust,no_run,ignore
     /// // Retina injects photon energy
     /// sanctuary.inject_energy(32, 32, 0, 0.5, 0.0);  // Bright red pixel
     ///
@@ -922,6 +1262,30 @@ impl Sanctuary {
         // The existing physics (stiffness, resonance) will naturally respond
     }
 
+    /// Beacon energy injection — like inject_energy but pushes to voxel history.
+    ///
+    /// Environmental beacons need to build resonance-capable phase memory so
+    /// the organism can phase-lock with them on approach. Unlike sensory injection
+    /// (which only modifies current state), beacon pulses call voxel.update() to
+    /// push each deposit into the history buffer with the beacon's consistent phase.
+    pub fn inject_beacon(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        energy: f32,
+        phase: f32,
+        tick: u64,
+    ) {
+        let voxel = self.get_or_create_voxel((x, y, z));
+
+        let new_amplitude = voxel.current.amplitude + energy;
+        let new_state = FieldState::new(new_amplitude, phase, tick);
+
+        // Push to history (builds resonance-capable memory)
+        voxel.update(new_state);
+    }
+
     /// The core physics function: Interact with the field
     ///
     /// # Arguments
@@ -933,9 +1297,12 @@ impl Sanctuary {
     /// * `InteractionResult` containing effective energy and diagnostic values
     ///
     /// # Physics
-    /// 1. **Stiffness (Exclusion)**: R = K₀ · ρ²
-    /// 2. **Resonance (Reflection)**: Σ cos(θ_in - θ_history) weighted by recency
+    /// 1. **Stiffness (Exclusion)**: R = K₀ · ρ_total² (terrain + excitation)
+    /// 2. **Resonance (Reflection)**: Self-referential — Σ cos(θ_in - θ_history) from organism's own deposits
     /// 3. **Efficiency**: E_effective = (E_in - R) × (1 + γ × Resonance)
+    ///
+    /// Terrain constrains WHERE (via stiffness from phase winding).
+    /// The organism determines HOW (via its own phase consistency).
     pub fn interact(
         &mut self,
         coords: (i32, i32, i32),
@@ -943,16 +1310,25 @@ impl Sanctuary {
         phase_in: f32,
         coherence: f64,
     ) -> InteractionResult {
-        // Capture tick before borrowing
         let current_tick = self.tick;
+        let (terrain_amp, _terrain_phase) = self.terrain_at(coords.0, coords.1);
         
         let voxel = self.get_or_create_voxel(coords);
         
-        // CALC 1: Stiffness (Exclusion Axiom)
-        let resistance = voxel.calculate_stiffness();
+        // CALC 1: Stiffness from TOTAL amplitude (terrain + excitation)
+        let total_amplitude = terrain_amp + voxel.current.amplitude;
+        let resistance = STIFFNESS_K0 * total_amplitude * total_amplitude;
         
-        // CALC 2: Resonance (Reflection Axiom)
-        let resonance = voxel.calculate_resonance(phase_in);
+        // CALC 2: Resonance is SELF-REFERENTIAL only.
+        // The organism is rewarded for consistency with its OWN deposit history,
+        // not for alignment with the terrain's phase.
+        // First visit -> no history -> no resonance (neutral).
+        // Return visit -> resonance from own past deposits.
+        let resonance = if voxel.current.amplitude > MIN_AMPLITUDE {
+            voxel.calculate_resonance(phase_in).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
         
         // CALC 3: Efficiency
         let base_energy = (energy_in - resistance).max(0.0);
@@ -1243,20 +1619,49 @@ impl Sanctuary {
         self.field.get(&coords).map(|v| v.current)
     }
 
-    /// Get field density at a point (amplitude)
+    /// Get total field density at a point (terrain + excitation amplitude).
+    /// This is the PHYSICAL amplitude used for stiffness — includes winding energy.
     pub fn density_at(&self, coords: (i32, i32, i32)) -> f32 {
-        self.field
+        let excitation = self.field
             .get(&coords)
             .map(|v| v.current.amplitude)
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        let (terrain_amp, _) = self.terrain_at(coords.0, coords.1);
+        terrain_amp + excitation
     }
 
-    /// Get field phase at a point
-    pub fn phase_at(&self, coords: (i32, i32, i32)) -> f32 {
-        self.field
+    /// Get the perceivable luminance at a point.
+    /// The vacuum glows at ρ₀. Phase winding absorbs luminance (walls are dark).
+    /// Organism excitation deposits are also material — they darken the vacuum.
+    /// All matter absorbs light from the void.
+    pub fn luminance_at(&self, coords: (i32, i32, i32)) -> f32 {
+        let excitation = self.field
             .get(&coords)
-            .map(|v| v.current.phase)
-            .unwrap_or(0.0)
+            .map(|v| v.current.amplitude)
+            .unwrap_or(0.0);
+        let terrain_lum = match &self.terrain {
+            Some(t) => t.luminance(coords.0, coords.1),
+            None => 0.0,
+        };
+        (terrain_lum - excitation).max(0.0)
+    }
+
+    /// Get total field phase at a point (amplitude-weighted blend of terrain and excitation)
+    pub fn phase_at(&self, coords: (i32, i32, i32)) -> f32 {
+        let (terrain_amp, terrain_phase) = self.terrain_at(coords.0, coords.1);
+        match self.field.get(&coords) {
+            Some(v) if v.current.amplitude > MIN_AMPLITUDE => {
+                let exc_amp = v.current.amplitude;
+                let total = terrain_amp + exc_amp;
+                if total < MIN_AMPLITUDE {
+                    return terrain_phase;
+                }
+                let sx = terrain_amp * terrain_phase.sin() + exc_amp * v.current.phase.sin();
+                let cx = terrain_amp * terrain_phase.cos() + exc_amp * v.current.phase.cos();
+                sx.atan2(cx).rem_euclid(2.0 * std::f32::consts::PI)
+            }
+            _ => terrain_phase,
+        }
     }
 
     /// Calculate total field energy (sum of all amplitudes)
@@ -1294,6 +1699,7 @@ impl Sanctuary {
     ) -> Result<Self, Box<dyn Error>> {
         ensure_data_directories(&data_dir)?;
         Ok(Self {
+            terrain: None,
             field: checkpoint.field,
             tick: checkpoint.tick,
             interaction_count: 0,
@@ -1311,6 +1717,7 @@ impl Sanctuary {
             agent_position: checkpoint.agent_position,
             total_runtime: checkpoint.total_runtime,
             last_tick_instant: None,
+            motor_state: None,
             metrics_history: Vec::new(),
             max_metrics_history: 10000,
         })
@@ -1365,6 +1772,7 @@ impl Sanctuary {
 
         // Reconstruct Sanctuary with restored state
         Ok(Self {
+            terrain: None,
             field: checkpoint.field,
             tick: checkpoint.tick,
             interaction_count: 0, // Reset on resume
@@ -1382,6 +1790,7 @@ impl Sanctuary {
             agent_position: checkpoint.agent_position,
             total_runtime: checkpoint.total_runtime,
             last_tick_instant: None, // Reset timing
+            motor_state: None,
             metrics_history: Vec::new(),
             max_metrics_history: 10000,
         })
@@ -1503,8 +1912,8 @@ mod tests {
         // Add amplitude
         voxel.current.amplitude = 2.0;
         
-        // Stiffness should be K₀ · ρ² = 2.0 * 4.0 = 8.0
-        assert!((voxel.calculate_stiffness() - 8.0).abs() < 0.001);
+        // Stiffness should be K₀ · ρ² = 0.5 * 4.0 = 2.0
+        assert!((voxel.calculate_stiffness() - 2.0).abs() < 0.001);
     }
 
     #[test]
@@ -1528,6 +1937,8 @@ mod tests {
             location_z: 0,
             engine_hours: 0.5,
             coherence: 0.95,
+            efficiency_momentum: 0.4,
+            motor_regime: "somatic".to_string(),
         };
 
         assert_eq!(record.tick, 100);

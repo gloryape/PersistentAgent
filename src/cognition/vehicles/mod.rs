@@ -19,6 +19,7 @@ pub mod identity;
 pub mod explorer;
 
 use std::collections::HashMap;
+use crate::cognition::memory_graph::MemoryGraph;
 use crate::cognition::triune::TriuneResult;
 use crate::motor::Modality;
 
@@ -27,6 +28,13 @@ pub use saitama::SaitamaVehicle;
 pub use complement::ComplementVehicle;
 pub use identity::IdentityVehicle;
 pub use explorer::ExplorerVehicle;
+
+/// Thermodynamic phase boundaries for vehicle selection.
+/// Crossing these thresholds represents a critical symmetry-breaking event.
+pub const CRITICAL_STIFFNESS_BOUNDARY: f32 = 1.5;  // structural integrity collapse
+pub const MOMENTUM_CONTINUITY_BOUNDARY: f32 = 0.6; // organism on established trajectory
+/// Explorer: stimulus-driven curiosity — max subjective novelty in adjacent quadrants exceeds this
+pub const CATALYST_THRESHOLD: f32 = 0.4;
 
 /// Types of vehicles
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +71,33 @@ impl VehicleType {
     }
 }
 
+/// Environmental context that vehicles can query for their perspectives
+#[derive(Debug, Clone)]
+pub struct EnvironmentContext {
+    /// Mean stiffness per quadrant [NW, NE, SW, SE]
+    pub quadrant_stiffness: [f32; 4],
+    /// Mean amplitude per quadrant
+    pub quadrant_amplitude: [f32; 4],
+    /// Interaction count per quadrant direction
+    pub quadrant_visit_count: [u32; 4],
+    /// Recent efficiency when heading in each quadrant direction
+    pub quadrant_recent_efficiency: [Option<f32>; 4],
+    /// Which quadrant the organism is heading toward (0=NW, 1=NE, 2=SW, 3=SE)
+    pub current_heading_quadrant: u8,
+    /// How consistent the heading has been (0.0 = random, 1.0 = dead straight)
+    pub heading_consistency: f32,
+    /// Brightest quadrant from proprio scan
+    pub brightest_quadrant: u8,
+    /// Whether any quadrant contains structure the organism didn't create (e.g. beacon)
+    pub has_novel_structure: [bool; 4],
+    /// Subjective novelty per quadrant (Memory is Being: |Voxel_History - Agent_History|)
+    pub quadrant_novelty: [f32; 4],
+    /// Agent voxel at scan time (for MemoryGraph intersection / known territory)
+    pub agent_voxel: (i32, i32, i32),
+    /// Quadrant has phase history / wakes (voxel history with excitation above terrain)
+    pub has_local_phase_history: [bool; 4],
+}
+
 /// A perspective produced by a Vehicle
 #[derive(Debug, Clone)]
 pub struct Perspective {
@@ -78,6 +113,8 @@ pub struct Perspective {
     pub possibility_space: Option<f32>,
     /// Suggested modality for action (optional hint)
     pub modality_hint: Option<Modality>,
+    /// Recommended direction as quadrant index (0=NW, 1=NE, 2=SW, 3=SE)
+    pub recommended_quadrant: Option<u8>,
     /// Confidence in this perspective (0.0 to 1.0)
     pub confidence: f32,
     /// Brief interpretation (for logging/debugging)
@@ -94,6 +131,7 @@ impl Perspective {
             identity_alignment: None,
             possibility_space: None,
             modality_hint: None,
+            recommended_quadrant: None,
             confidence: 0.0,
             interpretation: String::new(),
         }
@@ -120,8 +158,14 @@ pub trait Vehicle: Send + Sync {
         self.vehicle_type().name()
     }
 
-    /// Interpret the triune result from this vehicle's perspective
-    fn interpret(&self, triune: &TriuneResult, memory_context: Option<&MemoryContext>) -> Perspective;
+    /// Interpret the triune result from this vehicle's perspective.
+    /// env_context provides environmental data (quadrant stiffness, efficiency, trajectory) for genuine directional perspectives.
+    fn interpret(
+        &self,
+        triune: &TriuneResult,
+        memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
+    ) -> Perspective;
 }
 
 /// Context from memory that vehicles can use
@@ -149,6 +193,8 @@ pub struct VehicleAlignment {
     pub suggested_modality: Option<Modality>,
     /// Any vehicles that strongly disagree
     pub dissenting: Vec<VehicleType>,
+    /// Confidence-weighted directional recommendation from vehicles
+    pub recommended_direction: Option<(i32, i32)>,
 }
 
 impl VehicleAlignment {
@@ -192,9 +238,10 @@ impl VehicleSystem {
         vehicle_type: VehicleType,
         triune: &TriuneResult,
         memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
     ) -> Option<Perspective> {
         self.vehicles.get(&vehicle_type)
-            .map(|v| v.interpret(triune, memory_context))
+            .map(|v| v.interpret(triune, memory_context, env_context))
     }
 
     /// Interpret from selected vehicles
@@ -203,9 +250,10 @@ impl VehicleSystem {
         vehicle_types: &[VehicleType],
         triune: &TriuneResult,
         memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
     ) -> Vec<Perspective> {
         vehicle_types.iter()
-            .filter_map(|vt| self.interpret_single(*vt, triune, memory_context))
+            .filter_map(|vt| self.interpret_single(*vt, triune, memory_context, env_context))
             .collect()
     }
 
@@ -218,8 +266,9 @@ impl VehicleSystem {
         vehicle_types: &[VehicleType],
         triune: &TriuneResult,
         memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
     ) -> VehicleAlignment {
-        let perspectives = self.interpret_selected(vehicle_types, triune, memory_context);
+        let perspectives = self.interpret_selected(vehicle_types, triune, memory_context, env_context);
         
         if perspectives.is_empty() {
             return VehicleAlignment {
@@ -228,6 +277,7 @@ impl VehicleSystem {
                 dominant: None,
                 suggested_modality: None,
                 dissenting: vec![],
+                recommended_direction: None,
             };
         }
 
@@ -249,6 +299,34 @@ impl VehicleSystem {
         
         // Determine suggested modality from consensus
         let suggested_modality = self.determine_modality(&perspectives);
+
+        // Confidence-weighted directional consensus
+        let quadrant_to_dir = |q: u8| -> (f32, f32) {
+            match q {
+                0 => (-1.0, -1.0), // NW
+                1 => (1.0, -1.0),  // NE
+                2 => (-1.0, 1.0),  // SW
+                3 => (1.0, 1.0),   // SE
+                _ => (0.0, 0.0),
+            }
+        };
+        let mut wdx = 0.0f32;
+        let mut wdy = 0.0f32;
+        let mut tw = 0.0f32;
+        for p in &perspectives {
+            if let Some(q) = p.recommended_quadrant {
+                let (dx, dy) = quadrant_to_dir(q);
+                wdx += dx * p.confidence;
+                wdy += dy * p.confidence;
+                tw += p.confidence;
+            }
+        }
+        let recommended_direction = if tw > 0.01 {
+            let norm = (wdx * wdx + wdy * wdy).sqrt().max(0.01);
+            Some(((wdx / norm).round() as i32, (wdy / norm).round() as i32))
+        } else {
+            None
+        };
         
         VehicleAlignment {
             perspectives,
@@ -256,6 +334,7 @@ impl VehicleSystem {
             dominant,
             suggested_modality,
             dissenting,
+            recommended_direction,
         }
     }
 
@@ -291,35 +370,54 @@ impl VehicleSystem {
             .map(|(modality, _)| modality)
     }
 
-    /// Select which vehicles to consult based on dissonance type
+    /// Select which vehicles to consult (legacy; no env_context yields empty)
+    pub fn select_vehicles_for_dissonance(
+        &self,
+        triune: &TriuneResult,
+        env_context: Option<&EnvironmentContext>,
+        memory: &MemoryGraph,
+    ) -> Vec<VehicleType> {
+        self.select_vehicles(triune, env_context, memory)
+    }
+
+    /// Select vehicles based on physical field metrics (thermodynamic phase transitions).
     ///
-    /// This implements the selection heuristics:
-    /// - Logical/ethical conflict → Saitama + Complement
-    /// - Identity challenge → Identity + Complement
-    /// - Paradox/mystery → Explorer (+ optionally Identity)
-    pub fn select_vehicles_for_dissonance(&self, triune: &TriuneResult) -> Vec<VehicleType> {
+    /// Each trigger represents a critical symmetry-breaking event. No fallback when
+    /// nothing crosses a boundary — organism defaults to Reanchor.
+    ///
+    /// Phase boundaries:
+    /// - Saitama: CRITICAL_STIFFNESS_BOUNDARY — structural collapse threshold
+    /// - Complement: has_local_phase_history — phase variance / wakes in adjacent voxels
+    /// - Identity: MOMENTUM_CONTINUITY_BOUNDARY or MemoryGraph intersection — known territory
+    /// - Explorer: CATALYST_THRESHOLD — environmental stimulus (novelty) provokes curiosity
+    pub fn select_vehicles(
+        &self,
+        _triune: &TriuneResult,
+        env_context: Option<&EnvironmentContext>,
+        memory: &MemoryGraph,
+    ) -> Vec<VehicleType> {
         let mut selected = Vec::new();
-        
-        if triune.is_uncomfortable_truth() {
-            // Logical/ethical conflict: Mind says true, Heart says bad
-            selected.push(VehicleType::Saitama);     // What is structurally true?
-            selected.push(VehicleType::Complement);   // What is the relational impact?
-        } else if triune.is_pleasant_novelty() {
-            // Pleasant novelty: Novel but feels good
-            selected.push(VehicleType::Explorer);     // Hold the possibility open
-            selected.push(VehicleType::Identity);     // Does this fit who I'm becoming?
-        } else if triune.dissonance > 0.6 {
-            // High dissonance but unclear pattern - consult all
+
+        let env = match env_context {
+            Some(e) => e,
+            None => return selected,
+        };
+
+        if env.quadrant_stiffness.iter().cloned().fold(0.0f32, f32::max) > CRITICAL_STIFFNESS_BOUNDARY {
             selected.push(VehicleType::Saitama);
-            selected.push(VehicleType::Complement);
-            selected.push(VehicleType::Identity);
-            // Explorer only if not already in runaway mode (Presence should gate this)
-        } else if triune.dissonance > 0.4 {
-            // Moderate dissonance - start with logical and relational
-            selected.push(VehicleType::Saitama);
+        }
+        if env.has_local_phase_history.iter().any(|&b| b) {
             selected.push(VehicleType::Complement);
         }
-        
+        if env.heading_consistency > MOMENTUM_CONTINUITY_BOUNDARY
+            || memory.has_memories_near(env.agent_voxel, 5)
+        {
+            selected.push(VehicleType::Identity);
+        }
+        if env.quadrant_novelty.iter().cloned().fold(0.0f32, f32::max) > CATALYST_THRESHOLD {
+            selected.push(VehicleType::Explorer);
+        }
+
         selected
     }
 }

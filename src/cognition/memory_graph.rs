@@ -713,6 +713,12 @@ impl MemoryGraph {
         nearby
     }
 
+    /// Check if any memory nodes exist within radius of the given location.
+    /// Used by Identity vehicle to detect known territory (organism's assimilated causal past).
+    pub fn has_memories_near(&self, location: (i32, i32, i32), radius: i32) -> bool {
+        !self.query_nearby_memories(location, radius).is_empty()
+    }
+
     /// Calculate the local karmic field strength at a location
     /// 
     /// This aggregates the karmic weights of nearby memories, weighted by

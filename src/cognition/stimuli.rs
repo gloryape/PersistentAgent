@@ -23,6 +23,19 @@ pub enum StimulusSource {
     Internal {
         metabolic_state: MetabolicState,
     },
+    /// Proprioceptive spatial awareness — the organism's sense of field structure around it
+    Proprioceptive {
+        /// Brightness in each quadrant [NW, NE, SW, SE], 0.0-255.0
+        quadrant_brightness: [f32; 4],
+        /// Fraction of scanned voxels with amplitude > threshold
+        coverage: f32,
+        /// Asymmetry in quadrant brightness (0.0 = uniform, 1.0 = all in one quadrant)
+        directional_contrast: f32,
+        /// Which quadrant has the most structure (0=NW, 1=NE, 2=SW, 3=SE)
+        brightest_quadrant: usize,
+        /// Mean brightness across all scanned voxels
+        mean_brightness: f32,
+    },
 }
 
 /// Rectangular region (for visual stimuli)

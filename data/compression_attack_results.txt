@@ -1,0 +1,100 @@
+═══════════════════════════════════════════════════════════════
+  COMPRESSION ATTACK: Sufficient Statistic Test
+═══════════════════════════════════════════════════════════════
+  Histories tested: 40
+  Deposits per history: 20
+  Probe phases: 8
+  Total prediction tests: 320
+
+─── RESONANCE PREDICTION (d=2 vs d=1) ───
+  d=2 (C/W, S/W):
+    Max |predicted - actual| resonance: 1.79e-7
+    Mean |predicted - actual|:          2.79e-8
+
+  d=1 (scalar coherence = ||(C/W, S/W)||):
+    Max |predicted - actual| resonance: 2.0000
+    Mean |predicted - actual|:          0.6286
+
+─── EFFICIENCY PREDICTION (d=2 through full interact()) ───
+  Max |predicted - actual| efficiency: 1.79e-7
+  Mean |predicted - actual|:           2.01e-8
+
+─── VERDICT ───
+  d=2 SUFFICIENT: The pair (C/W, S/W) perfectly predicts resonance.
+  The history buffer is REDUCIBLE to a 2D complex moment.
+  The groupoid classification is correct but embeds into R².
+
+  IMPLICATION FOR PAPER #2:
+  The current bilinear cosine kernel admits a finite sufficient
+  statistic. History dependence is real (the 2D moment encodes it)
+  but the infinite history buffer is unnecessary — the resonance
+  function depends only on the first circular moment.
+
+  For genuine irreducibility (d = infinity), the kernel would need
+  higher-order phase interactions: cos(k(θ_in - θᵢ)) for k > 1,
+  sequential phase differences (Δθᵢ = θᵢ - θᵢ₋₁), or nonlinear
+  history functionals. These are discussed in the paper as open
+  directions for kernel enrichment.
+
+  d=1 INSUFFICIENT: Scalar coherence cannot predict directional resonance.
+  This confirms Result 2 (directional dependence) from the scattering
+  experiment: the invariant is vectorial, not scalar.
+
+─── PER-HISTORY DETAIL ───
+  [  0] single_phase              | C/W=+1.0000 S/W=+0.0000 |c|=1.0000 | max_err_2d=5.96e-8 max_err_1d=2.0000
+  [  1] single_phase              | C/W=+0.7091 S/W=+0.7022 |c|=0.9980 | max_err_2d=1.64e-7 max_err_1d=1.9960
+  [  2] single_phase              | C/W=+0.0069 S/W=+0.9931 |c|=0.9932 | max_err_2d=1.19e-7 max_err_1d=1.9863
+  [  3] single_phase              | C/W=-0.6954 S/W=+0.7022 |c|=0.9883 | max_err_2d=5.96e-8 max_err_1d=1.9766
+  [  4] single_phase              | C/W=-0.9863 S/W=-0.0000 |c|=0.9863 | max_err_2d=5.96e-8 max_err_1d=1.9725
+  [  5] single_phase              | C/W=-0.6954 S/W=-0.7022 |c|=0.9883 | max_err_2d=1.19e-7 max_err_1d=1.9766
+  [  6] single_phase              | C/W=+0.0069 S/W=-0.9931 |c|=0.9932 | max_err_2d=5.96e-8 max_err_1d=1.9863
+  [  7] single_phase              | C/W=+0.7091 S/W=-0.7022 |c|=0.9980 | max_err_2d=1.19e-7 max_err_1d=1.9960
+  [  8] uniform_sweep             | C/W=-0.1060 S/W=-0.3778 |c|=0.3924 | max_err_2d=8.94e-8 max_err_1d=0.7702
+  [  9] reverse_sweep             | C/W=+0.0162 S/W=+0.3942 |c|=0.3945 | max_err_2d=1.19e-7 max_err_1d=0.7887
+  [ 10] alternating_opposed       | C/W=+0.0535 S/W=+0.0466 |c|=0.0710 | max_err_2d=7.82e-8 max_err_1d=0.1418
+  [ 11] three_phase_cycle         | C/W=+0.0734 S/W=-0.0331 |c|=0.0805 | max_err_2d=2.24e-8 max_err_1d=0.1557
+  [ 12] clustered_with_outliers   | C/W=+0.3395 S/W=+0.7202 |c|=0.7962 | max_err_2d=5.96e-8 max_err_1d=1.5455
+  [ 13] pseudo_random             | C/W=+0.2213 S/W=+0.6573 |c|=0.6936 | max_err_2d=1.19e-7 max_err_1d=1.3509
+  [ 14] pseudo_random             | C/W=+0.2327 S/W=+0.6878 |c|=0.7261 | max_err_2d=1.19e-7 max_err_1d=1.4140
+  [ 15] pseudo_random             | C/W=-0.2081 S/W=+0.6770 |c|=0.7083 | max_err_2d=5.96e-8 max_err_1d=1.3853
+  [ 16] pseudo_random             | C/W=-0.2091 S/W=+0.7397 |c|=0.7687 | max_err_2d=8.94e-8 max_err_1d=1.5084
+  [ 17] pseudo_random             | C/W=-0.1682 S/W=+0.6515 |c|=0.6728 | max_err_2d=5.96e-8 max_err_1d=1.3243
+  [ 18] pseudo_random             | C/W=+0.1435 S/W=+0.5721 |c|=0.5898 | max_err_2d=1.79e-7 max_err_1d=1.1619
+  [ 19] pseudo_random             | C/W=-0.0788 S/W=+0.5841 |c|=0.5894 | max_err_2d=5.96e-8 max_err_1d=1.1735
+  [ 20] pseudo_random             | C/W=-0.0405 S/W=+0.6721 |c|=0.6733 | max_err_2d=5.96e-8 max_err_1d=1.3453
+  [ 21] pseudo_random             | C/W=+0.1869 S/W=+0.7420 |c|=0.7652 | max_err_2d=5.96e-8 max_err_1d=1.5073
+  [ 22] pseudo_random             | C/W=-0.1275 S/W=+0.6871 |c|=0.6988 | max_err_2d=1.19e-7 max_err_1d=1.3859
+  [ 23] pseudo_random             | C/W=-0.0349 S/W=+0.6068 |c|=0.6078 | max_err_2d=8.94e-8 max_err_1d=1.2147
+  [ 24] pseudo_random             | C/W=-0.2117 S/W=+0.7093 |c|=0.7402 | max_err_2d=5.96e-8 max_err_1d=1.4495
+  [ 25] pseudo_random             | C/W=+0.1605 S/W=+0.5854 |c|=0.6070 | max_err_2d=5.96e-8 max_err_1d=1.1924
+  [ 26] pseudo_random             | C/W=+0.1694 S/W=+0.5727 |c|=0.5973 | max_err_2d=1.19e-7 max_err_1d=1.1700
+  [ 27] pseudo_random             | C/W=-0.1680 S/W=+0.7819 |c|=0.7997 | max_err_2d=1.19e-7 max_err_1d=1.5816
+  [ 28] pseudo_random             | C/W=+0.1271 S/W=+0.6838 |c|=0.6955 | max_err_2d=8.94e-8 max_err_1d=1.3793
+  [ 29] pseudo_random             | C/W=-0.2579 S/W=+0.6560 |c|=0.7049 | max_err_2d=1.19e-7 max_err_1d=1.3609
+  [ 30] pseudo_random             | C/W=-0.1575 S/W=+0.4013 |c|=0.4311 | max_err_2d=5.96e-8 max_err_1d=0.8323
+  [ 31] pseudo_random             | C/W=+0.1650 S/W=+0.6370 |c|=0.6581 | max_err_2d=8.94e-8 max_err_1d=1.2951
+  [ 32] pseudo_random             | C/W=-0.0420 S/W=+0.7077 |c|=0.7089 | max_err_2d=1.19e-7 max_err_1d=1.4166
+  [ 33] half_and_half             | C/W=-0.5076 S/W=-0.0000 |c|=0.5076 | max_err_2d=5.96e-8 max_err_1d=1.0151
+  [ 34] gradual_drift             | C/W=+0.5168 S/W=+0.7831 |c|=0.9382 | max_err_2d=1.19e-7 max_err_1d=1.8574
+  [ 35] oscillating               | C/W=-0.0347 S/W=+0.3089 |c|=0.3108 | max_err_2d=4.47e-8 max_err_1d=0.6197
+  [ 36] pair_shifted              | C/W=+0.0728 S/W=-0.0000 |c|=0.0728 | max_err_2d=3.73e-8 max_err_1d=0.1457
+  [ 37] pair_shifted              | C/W=+0.0535 S/W=+0.0466 |c|=0.0710 | max_err_2d=7.82e-8 max_err_1d=0.1418
+  [ 38] pair_shifted              | C/W=+0.0069 S/W=+0.0660 |c|=0.0663 | max_err_2d=6.33e-8 max_err_1d=0.1323
+  [ 39] pair_shifted              | C/W=-0.0398 S/W=+0.0466 |c|=0.0613 | max_err_2d=1.18e-7 max_err_1d=0.1224
+
+─── MATHEMATICAL EXPLANATION ───
+  The resonance formula is:
+    resonance(θ) = Σᵢ wᵢaᵢcos(θ - θᵢ) / Σᵢ wᵢaᵢ
+
+  Using cos(θ - θᵢ) = cos(θ)cos(θᵢ) + sin(θ)sin(θᵢ):
+    resonance(θ) = cos(θ)·(C/W) + sin(θ)·(S/W)
+
+  where C = Σᵢ wᵢaᵢcos(θᵢ), S = Σᵢ wᵢaᵢsin(θᵢ), W = Σᵢ wᵢaᵢ
+
+  This is a LINEAR function of cos(θ) and sin(θ), parameterized
+  by (C/W, S/W). Therefore the entire history buffer is captured
+  by two real numbers. QED.
+
+  For d=2 to FAIL, the resonance function would need to depend on
+  higher harmonics: cos(2θ), cos(3θ), etc. Each harmonic adds 2
+  dimensions to the sufficient statistic.

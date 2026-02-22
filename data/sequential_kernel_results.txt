@@ -1,0 +1,51 @@
+═══════════════════════════════════════════════════════════════
+  SEQUENTIAL KERNEL: Cross-Moment Complexity Test
+═══════════════════════════════════════════════════════════════
+  Histories: 40
+  Probe phases: 8
+  β values tested: [0.0, 0.3, 0.5, 0.8, 1.0]
+  Tests per β: 320
+
+─── CONTROL: β=0 vs original calculate_resonance ───
+  Max |original - seq(β=0)|: 0.00e0
+  ✓ Sequential kernel matches original when β=0
+
+─── SEQUENTIAL KERNEL RESULTS ───
+      β |        d=2 max       d=2 mean |        d=4 max       d=4 mean |        d=8 max       d=8 mean
+  ---------------------------------------------------------------------------------------------------------
+    0.0 |        1.79e-7        2.67e-8 |        1.79e-7        2.74e-8 |        1.79e-7        2.67e-8
+    0.3 |        2.29e-1        6.55e-2 |        4.60e-1        1.00e-1 |        1.79e-7        4.31e-8
+    0.5 |        3.31e-1        9.46e-2 |        6.64e-1        1.45e-1 |        2.38e-7        3.10e-8
+    0.8 |        4.41e-1        1.26e-1 |        8.86e-1        1.93e-1 |        2.38e-7        3.20e-8
+    1.0 |        4.97e-1        1.42e-1 |        9.97e-1        2.17e-1 |        1.70e-7        2.68e-8
+
+─── ANALYSIS ───
+  ✓ SEQUENTIAL COMPLEXITY DEMONSTRATED:
+    d=2 fails (missing sequential structure)
+    d=4 fails (harmonics alone don't capture cross-moments)
+    d=8 succeeds (cross-moments between consecutive entries)
+
+  This is a DIFFERENT axis of complexity than harmonic enrichment.
+  Harmonics increase d by enriching individual-entry statistics.
+  Sequential coupling increases d by requiring pair statistics.
+
+  For coupling to k-step neighbors (θᵢ - θᵢ₋ₖ), d grows as:
+    k=1: d=8 (cross-moments with predecessor)
+    k=2: d~14 (cross-moments with two predecessors)
+    k=N: d ∝ N (cross-moments scale with coupling depth)
+
+  Combined with harmonics:
+    K harmonics × k-step coupling → d = O(K·k)
+    Full coupling to all harmonics and all steps → d = ∞
+
+─── IMPLICATIONS ───
+  The complexity hierarchy has TWO independent axes:
+
+  AXIS 1 (Harmonic): How many Fourier modes of phase?
+    cos(θ-θᵢ) → d=2, cos(kθ-kθᵢ) for k≤K → d=2K
+
+  AXIS 2 (Sequential): How many consecutive entries are coupled?
+    No coupling → d+0, 1-step → d+6, k-step → d+O(k)
+
+  Total: d = 2K + O(k) where K = harmonic depth, k = coupling depth
+  For K=∞ or k=∞ (full Fourier × full history): d=∞

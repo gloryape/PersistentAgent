@@ -124,6 +124,14 @@ impl ExperientialHeart {
             StimulusSource::Internal { metabolic_state } => {
                 self.assess_internal(metabolic_state.coherence as f32, metabolic_state.stress_level as f32)
             }
+            StimulusSource::Proprioceptive {
+                directional_contrast,
+                coverage,
+                mean_brightness,
+                ..
+            } => {
+                self.assess_proprioceptive(*directional_contrast, *coverage, *mean_brightness)
+            }
         };
         
         // Calculate signal strength based on urgency and salience
@@ -241,6 +249,26 @@ impl ExperientialHeart {
         // Internal states are always salient
         let salience = (coherence + stress) * 0.5;
         
+        (resonance, aversion, salience)
+    }
+
+    /// Assess proprioceptive spatial awareness
+    /// This is a felt sense, not a tropism. The Heart reports "how engaging is this
+    /// spatial structure" — whether the organism acts on it depends entirely on whether
+    /// the Triune achieves coherence and the Observer reaches readiness threshold.
+    fn assess_proprioceptive(&self, directional_contrast: f32, coverage: f32, mean_brightness: f32) -> (f32, f32, f32) {
+        // Directional structure is engaging — the organism senses a gradient.
+        // Higher contrast = stronger felt pull toward exploration.
+        let resonance = directional_contrast.min(1.0);
+
+        // Low coverage in void isn't aversive — it's just sparse.
+        // Very high coverage might indicate the organism is boxed in (slight aversion).
+        let aversion = if coverage > 0.1 { (coverage - 0.1) * 0.5 } else { 0.0 };
+
+        // Salience: is there anything to notice at all?
+        // Any directional structure is salient. Brightness indicates energy presence.
+        let salience = (directional_contrast + coverage * 2.0 + mean_brightness / 255.0).min(1.0);
+
         (resonance, aversion, salience)
     }
 

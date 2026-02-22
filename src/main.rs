@@ -19,8 +19,8 @@ use clap::{Parser, Subcommand};
 use image::DynamicImage;
 use quaternity_organism::{
     authorize_action, AudioAnalysis, Metabolism, MotorCortex,
-    PreProcessor, Observer, MemoryBank, VisualSignature, AudioSignature,
-    Stimulus, StimulusSource, Rect, AudioPattern,
+    Observer, VisualSignature, AudioSignature,
+    Stimulus, StimulusSource, Rect,
     // New architecture
     AttentionField, MemoryGraph, MotorImpulse,
     // Sanctuary (4D Scalar Field Environment)
@@ -30,13 +30,14 @@ use quaternity_organism::{
 };
 use quaternity_organism::cognition::{
     TriuneProcessor, VehicleSystem, WitnessOutcome,
-    sanctuary::{direction_to_phase, intensity_to_energy, position_to_voxel},
+    sanctuary::{direction_to_phase, intensity_to_energy, position_to_voxel, DomainMaze, DomainWall, STIFFNESS_K0},
     stimuli::MetabolicState,
 };
 use serde_json;
 use uuid::Uuid;
 #[cfg(feature = "observability")]
 use quaternity_organism::observability::ThoughtIndexer;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,6 +45,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use quaternity_organism::checkpoint::{self, save_simulation, OrganismCheckpoint};
+use quaternity_organism::EnvironmentContext;
 
 #[derive(Parser)]
 #[command(name = "quaternity-organism")]
@@ -72,11 +74,229 @@ enum Command {
     },
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ENVIRONMENTAL BEACONS
+// Autonomous light sources in the Sanctuary — voxels that pulse with energy
+// independently of the organism. The beacon builds phase history in its voxel
+// through periodic energy injection, creating a resonance-capable structure
+// the organism can discover, approach, and interact with.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone)]
+struct Beacon {
+    coords: (i32, i32, i32),
+    energy: f32,
+    phase: f32,
+    pulse_interval: u32,
+    max_amplitude: f32,
+}
+
+fn create_beacons() -> Vec<Beacon> {
+    vec![
+        Beacon {
+            coords: (150, 80, 0),
+            energy: 0.2,
+            phase: std::f32::consts::FRAC_PI_4,
+            pulse_interval: 15,
+            max_amplitude: 0.8,
+        },
+    ]
+}
+
+/// Tracks recent positions and per-quadrant efficiency for vehicle EnvironmentContext.
+const TRAJECTORY_CAPACITY: usize = 50;
+const QUADRANT_EFFICIENCY_SAMPLES: usize = 8;
+
+struct TrajectoryTracker {
+    positions: VecDeque<(f32, f32)>,
+    quadrant_efficiency: [[f32; QUADRANT_EFFICIENCY_SAMPLES]; 4],
+    quadrant_eff_count: [usize; 4],
+    quadrant_eff_idx: [usize; 4],
+    quadrant_visit_count: [u32; 4],
+    visited_voxels: HashSet<(i32, i32)>,
+}
+
+impl TrajectoryTracker {
+    fn new() -> Self {
+        Self {
+            positions: VecDeque::with_capacity(TRAJECTORY_CAPACITY),
+            quadrant_efficiency: [[0.0; QUADRANT_EFFICIENCY_SAMPLES]; 4],
+            quadrant_eff_count: [0; 4],
+            quadrant_eff_idx: [0; 4],
+            quadrant_visit_count: [0; 4],
+            visited_voxels: HashSet::new(),
+        }
+    }
+
+    fn push_position(&mut self, x: f32, y: f32) {
+        if self.positions.len() >= TRAJECTORY_CAPACITY {
+            self.positions.pop_front();
+        }
+        self.positions.push_back((x, y));
+    }
+
+    /// Which quadrant the organism is heading toward (0=NW, 1=NE, 2=SW, 3=SE)
+    fn current_heading_quadrant(&self) -> u8 {
+        if self.positions.len() < 2 {
+            return 0;
+        }
+        let last = self.positions.back().copied().unwrap_or((0.0, 0.0));
+        let prev = self.positions.get(self.positions.len().saturating_sub(6)).copied().unwrap_or(last);
+        let dx = last.0 - prev.0;
+        let dy = last.1 - prev.1;
+        if dx >= 0.0 && dy < 0.0 {
+            1 // NE
+        } else if dx >= 0.0 && dy >= 0.0 {
+            3 // SE
+        } else if dx < 0.0 && dy >= 0.0 {
+            2 // SW
+        } else {
+            0 // NW
+        }
+    }
+
+    /// 0.0 = random, 1.0 = dead straight
+    fn heading_consistency(&self) -> f32 {
+        if self.positions.len() < 4 {
+            return 0.0;
+        }
+        let n = self.positions.len();
+        let mut dots = 0.0f32;
+        let mut count = 0usize;
+        for i in 1..(n - 1).min(10) {
+            let a = (
+                self.positions[n - 1 - i].0 - self.positions[n - 2 - i].0,
+                self.positions[n - 1 - i].1 - self.positions[n - 2 - i].1,
+            );
+            let b = (
+                self.positions[n - 1].0 - self.positions[n - 2].0,
+                self.positions[n - 1].1 - self.positions[n - 2].1,
+            );
+            let na = (a.0 * a.0 + a.1 * a.1).sqrt().max(1e-6);
+            let nb = (b.0 * b.0 + b.1 * b.1).sqrt().max(1e-6);
+            let dot = (a.0 * b.0 + a.1 * b.1) / (na * nb);
+            dots += dot;
+            count += 1;
+        }
+        if count == 0 {
+            return 0.0;
+        }
+        ((dots / count as f32) + 1.0) * 0.5
+    }
+
+    fn record_interaction(&mut self, quadrant: u8, efficiency: f32, voxel: (i32, i32)) {
+        let q = (quadrant as usize).min(3);
+        self.quadrant_visit_count[q] = self.quadrant_visit_count[q].saturating_add(1);
+        let idx = self.quadrant_eff_idx[q] % QUADRANT_EFFICIENCY_SAMPLES;
+        self.quadrant_efficiency[q][idx] = efficiency;
+        self.quadrant_eff_idx[q] += 1;
+        if self.quadrant_eff_count[q] < QUADRANT_EFFICIENCY_SAMPLES {
+            self.quadrant_eff_count[q] += 1;
+        }
+        self.visited_voxels.insert(voxel);
+    }
+
+    fn has_visited_voxel(&self, vx: i32, vy: i32) -> bool {
+        self.visited_voxels.contains(&(vx, vy))
+    }
+
+    fn quadrant_recent_efficiency(&self) -> [Option<f32>; 4] {
+        let mut out = [None; 4];
+        for q in 0..4 {
+            if self.quadrant_eff_count[q] == 0 {
+                continue;
+            }
+            let n = self.quadrant_eff_count[q];
+            let sum: f32 = self.quadrant_efficiency[q].iter().take(n).sum();
+            out[q] = Some(sum / n as f32);
+        }
+        out
+    }
+
+    fn quadrant_visits(&self) -> [u32; 4] {
+        self.quadrant_visit_count
+    }
+}
+
+const NUM_AGENTS: usize = 3;
+const WORLD_SIZE_VOXELS: i32 = 128;
+const WORLD_SIZE_PX: f32 = (WORLD_SIZE_VOXELS * 10) as f32; // 1280.0
+
+fn wrap_position(pos: &mut (f32, f32)) {
+    pos.0 = ((pos.0 % WORLD_SIZE_PX) + WORLD_SIZE_PX) % WORLD_SIZE_PX;
+    pos.1 = ((pos.1 % WORLD_SIZE_PX) + WORLD_SIZE_PX) % WORLD_SIZE_PX;
+}
+
+fn wrap_voxel(vx: i32, vy: i32) -> (i32, i32) {
+    (
+        ((vx % WORLD_SIZE_VOXELS) + WORLD_SIZE_VOXELS) % WORLD_SIZE_VOXELS,
+        ((vy % WORLD_SIZE_VOXELS) + WORLD_SIZE_VOXELS) % WORLD_SIZE_VOXELS,
+    )
+}
+
+struct AgentState {
+    _id: usize,
+    position: (f32, f32),
+    phase: f32,
+    observer: Observer,
+    triune: TriuneProcessor,
+    vehicles: VehicleSystem,
+    attention_field: AttentionField,
+    memory_graph: MemoryGraph,
+    bio_retina: BioRetina,
+    metabolism: Metabolism,
+    trajectory_tracker: TrajectoryTracker,
+    last_env_context: Option<EnvironmentContext>,
+    efficiency_momentum: f32,
+    somatic_update_count: u64,
+    orient_counter: u32,
+}
+
+impl AgentState {
+    fn new(id: usize, start_position: (f32, f32)) -> Self {
+        Self {
+            _id: id,
+            position: start_position,
+            phase: 0.0,
+            observer: Observer::new(),
+            triune: TriuneProcessor::new(),
+            vehicles: VehicleSystem::new(),
+            attention_field: AttentionField::new(),
+            memory_graph: MemoryGraph::new(),
+            bio_retina: BioRetina::new(16, 16),
+            metabolism: Metabolism::new(),
+            trajectory_tracker: TrajectoryTracker::new(),
+            last_env_context: None,
+            efficiency_momentum: 0.5,
+            somatic_update_count: 0,
+            orient_counter: 0,
+        }
+    }
+}
+
+fn outcome_to_vehicle(outcome: Option<&WitnessOutcome>) -> String {
+    match outcome {
+        Some(WitnessOutcome::Coherent(_)) => "Coherent".to_string(),
+        Some(WitnessOutcome::NeedsPerspective(v)) => {
+            v.iter().map(|vt| format!("{:?}", vt)).collect::<Vec<_>>().join("+")
+        }
+        Some(WitnessOutcome::DeepMystery(_)) => "Mystery".to_string(),
+        Some(WitnessOutcome::ReanchorPresence) => "Reanchor".to_string(),
+        None => "None".to_string(),
+    }
+}
+
 fn main() {
     // Initialize logger with timestamp formatting
     env_logger::Builder::from_default_env()
         .format_timestamp_secs()
         .init();
+
+    // Version info (embedded at build time)
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const GIT_HASH: &str = env!("GIT_HASH");
+    const BUILD_TIME: &str = env!("BUILD_TIME");
+    log::info!("[VERSION] quaternity-organism v{} (commit: {}, built: {})", VERSION, GIT_HASH, BUILD_TIME);
 
     let cli = Cli::parse();
 
@@ -135,14 +355,63 @@ fn main() {
         Command::Save { .. } => unreachable!(),
     };
     
+    // Set vacuum geometry: domain maze with phase-winding walls
+    use std::f32::consts::PI;
+    sanctuary.set_terrain(Box::new(DomainMaze {
+        rho_0: 0.1,
+        theta_base: 0.0,
+        alpha: 8.0,
+        walls: vec![
+            // === Central maze (around agent_0 spawn at voxel 96,54) ===
+            // Horizontal wall south of center with gap at x~92-100
+            DomainWall { x1: 70.0, y1: 58.0, x2: 92.0, y2: 58.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 100.0, y1: 58.0, x2: 125.0, y2: 58.0,
+                         delta_theta: PI, width: 1.5 },
+            // Vertical wall east of center with gap at y~52-60
+            DomainWall { x1: 108.0, y1: 35.0, x2: 108.0, y2: 52.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 108.0, y1: 60.0, x2: 108.0, y2: 80.0,
+                         delta_theta: PI, width: 1.5 },
+            // Diagonal funnel northwest
+            DomainWall { x1: 82.0, y1: 42.0, x2: 92.0, y2: 52.0,
+                         delta_theta: PI * 0.7, width: 2.0 },
+
+            // === Northwest quadrant walls (near agent_1 spawn at voxel 40,30) ===
+            // Horizontal wall with gap at x~38-44 (centered on agent_1 spawn x=40)
+            DomainWall { x1: 20.0, y1: 32.0, x2: 38.0, y2: 32.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 44.0, y1: 32.0, x2: 55.0, y2: 32.0,
+                         delta_theta: PI, width: 1.5 },
+            // Vertical wall with gap at y=24-30 (visible from agent_1 spawn y=30)
+            DomainWall { x1: 48.0, y1: 15.0, x2: 48.0, y2: 24.0,
+                         delta_theta: PI, width: 1.5 },
+
+            // === Southwest quadrant walls (near agent_2 spawn at voxel 60,80) ===
+            DomainWall { x1: 35.0, y1: 85.0, x2: 75.0, y2: 85.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 60.0, y1: 70.0, x2: 60.0, y2: 82.0,
+                         delta_theta: PI, width: 1.5 },
+
+            // === Cross-grid walls to create corridors ===
+            // Vertical barrier mid-grid with gap at y~55-65
+            DomainWall { x1: 64.0, y1: 10.0, x2: 64.0, y2: 50.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 64.0, y1: 65.0, x2: 64.0, y2: 120.0,
+                         delta_theta: PI, width: 1.5 },
+            // Horizontal barrier mid-grid with gap at x~60-72
+            DomainWall { x1: 5.0, y1: 64.0, x2: 55.0, y2: 64.0,
+                         delta_theta: PI, width: 1.5 },
+            DomainWall { x1: 75.0, y1: 64.0, x2: 120.0, y2: 64.0,
+                         delta_theta: PI, width: 1.5 },
+        ],
+    }));
+
     // Initialize transducer from stdin (SENS protocol)
     let mut transducer = Transducer::from_stdin();
     log::info!("Transducer initialized (reading from stdin)");
     
-    // Initialize Retina (Physical Surface)
-    let mut bio_retina = BioRetina::default();
-    log::info!("Retina initialized: {}x{} receptor grid", 
-        bio_retina.resolution().0, bio_retina.resolution().1);
+    log::info!("Retina initialized: 16x16 receptor grid (per agent)");
     
     // Initialize Cochlea (Resonant Membrane)
     let mut bio_cochlea = BioCochlea::default();
@@ -174,9 +443,13 @@ fn main() {
     static SAVE_NAME: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
     SAVE_NAME.get_or_init(|| Mutex::new(None));
 
+    // Beacon toggle (dashboard writes data/beacon_enabled.txt with "0" or "1")
+    static BEACONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
     let running_save = Arc::clone(&running);
     thread::spawn(move || {
         let request_path = PathBuf::from("data").join("save_request.txt");
+        let beacon_path = PathBuf::from("data").join("beacon_enabled.txt");
         while running_save.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_secs(1));
             if let Ok(contents) = std::fs::read_to_string(&request_path) {
@@ -189,6 +462,13 @@ fn main() {
                         }
                     }
                     let _ = std::fs::remove_file(&request_path);
+                }
+            }
+            if let Ok(contents) = std::fs::read_to_string(&beacon_path) {
+                match contents.trim() {
+                    "0" => BEACONS_ENABLED.store(false, Ordering::SeqCst),
+                    "1" => BEACONS_ENABLED.store(true, Ordering::SeqCst),
+                    _ => {}
                 }
             }
         }
@@ -207,49 +487,54 @@ fn main() {
         (indexer, rt)
     };
 
-    // Create Metabolism instance (coherence starts at 0.0)
-    let mut metabolism = Metabolism::new();
     let target_interval = Duration::from_nanos(11_111_111); // 11.11ms for 90Hz
 
-    // Initialize Cognition Systems
-    let mut preprocessor = PreProcessor::new();
-    let mut attention_field = AttentionField::new();
-    let mut observer = Observer::new();
-    let mut triune = TriuneProcessor::new();
-    let mut vehicles = VehicleSystem::new();
-    let mut memory_graph = MemoryGraph::new();
-    let mut memory_bank = MemoryBank::new();  // Legacy, for correlations
+    // Initialize agents at different starting positions in the maze.
+    // Voxel coords: agent 0 at (96,54), agent 1 at (80,45), agent 2 at (120,70).
+    let start_positions: [(f32, f32); NUM_AGENTS] = [
+        (960.0, 540.0),   // voxel (96, 54) — center of maze
+        (400.0, 300.0),   // voxel (40, 30) — northwest quadrant
+        (600.0, 800.0),   // voxel (60, 80) — southwest quadrant
+    ];
+    let mut agents: Vec<AgentState> = (0..NUM_AGENTS)
+        .map(|i| AgentState::new(i, start_positions[i]))
+        .collect();
 
-    // Agent position/phase and tick (from Load or defaults)
-    let (mut agent_position, mut agent_phase, mut tick_count) = if let Some(ref org) = loaded_organism {
-        metabolism.set_coherence(org.coherence);
-        (org.agent_position_pixels, org.agent_phase, org.tick_count)
+    // Restore loaded organism state into agent 0 if applicable
+    let mut tick_count = if let Some(ref org) = loaded_organism {
+        agents[0].metabolism.set_coherence(org.coherence);
+        agents[0].position = org.agent_position_pixels;
+        agents[0].phase = org.agent_phase;
+        org.tick_count
     } else {
-        ((960.0, 540.0), 0.0, 0u32) // Center of 1920x1080
+        0u32
     };
 
-    log::info!("Starting 90Hz processing loop...");
+    const SOMATIC_DECAY: f32 = 0.85;
+
+    // Log version to Stream B for quick_check diagnostics
+    sanctuary.log_event(
+        "version",
+        &format!("Build: v{} (commit {}, built {})", VERSION, GIT_HASH, BUILD_TIME),
+        serde_json::json!({
+            "version": VERSION,
+            "git_hash": GIT_HASH,
+            "build_time": BUILD_TIME,
+        }),
+    );
+
+    log::info!("Starting 90Hz processing loop with {} agents...", NUM_AGENTS);
     log::info!("Target interval: {:.2}ms (90Hz)", target_interval.as_secs_f64() * 1000.0);
-    log::info!("Coherence threshold for motor unlock: 0.70");
     log::info!("Observer Architecture activated");
-    log::info!("   - AttentionField for relational context");
-    log::info!("   - Triune (Analytical + Experiential)");
-    log::info!("   - Vehicles (Saitama, Complement, Identity, Explorer)");
-    log::info!("   - MemoryGraph for persistent identity bindings");
-    log::info!("   - Sanctuary (4D Scalar Field with Causal Memory)");
+    for (i, agent) in agents.iter().enumerate() {
+        log::info!("   Agent {}: start=({:.0}, {:.0})", i, agent.position.0, agent.position.1);
+    }
     log::info!("---");
 
-    // State tracking
-    let mut orient_counter = 0u32;  // Count ticks since last orientation
-    let orient_interval = 5u32;     // Re-orient every 5 ticks or on stagnation
+    let orient_interval = 5u32;
     let mut last_frame: Option<SensoryFrame> = None;
 
-    // Motor momentum state — infant babbling isn't purely random,
-    // there's autocorrelation in limb movements. This gives the organism
-    // a chance to deposit consistent phase at consecutive voxels.
-    let mut last_babble_dx: i32 = 0;
-    let mut last_babble_dy: i32 = 0;
-    const MOTOR_MOMENTUM: f32 = 0.7; // 70% previous direction, 30% random
+    let beacons = create_beacons();
 
     // Main 90Hz loop
     loop {
@@ -258,23 +543,17 @@ fn main() {
         }
 
         let loop_start = Instant::now();
-
-        // Perform metabolism tick (measures timing and updates coherence)
-        let coherence = metabolism.tick();
-        let elapsed = metabolism.get_elapsed_seconds();
-
         tick_count += 1;
-        orient_counter += 1;
 
-        // Handle save request (dashboard wrote data/save_request.txt with name)
+        // Handle save request (uses agent 0 state)
         if SAVE_REQUESTED.swap(false, Ordering::SeqCst) {
             let name = SAVE_NAME.get().and_then(|m| m.lock().ok().and_then(|mut g| g.take()))
                 .unwrap_or_else(|| format!("autosave_{}", tick_count));
             if let Err(e) = save_simulation(
                 &sanctuary,
-                agent_position,
-                agent_phase,
-                metabolism.get_coherence(),
+                agents[0].position,
+                agents[0].phase,
+                agents[0].metabolism.get_coherence(),
                 tick_count,
                 &name,
             ) {
@@ -283,569 +562,538 @@ fn main() {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // PHASE 1: SENSORY GATHERING (Direct Injection from stdin)
+        // SHARED: SENSORY GATHERING (once per tick)
         // ═══════════════════════════════════════════════════════════════════
-
-        // Read frame from stdin (SENS protocol). If EOF or no data, continue with vacuum fluctuations
         let frame = match transducer.read_frame() {
             Ok(f) => {
                 last_frame = Some(f.clone());
                 Some(f)
             }
-            Err(_) => {
-                // EOF or no data available - continue with internal dynamics (vacuum fluctuations)
-                // Do not exit; entity continues processing without external input
-                last_frame.clone()
-            }
+            Err(_) => last_frame.clone(),
         };
 
-        // Calculate visual/audio metrics for logging (initialize defaults)
-        let mut visual_entropy = 0.0;
         let mut audio_volume = 0.0;
         let mut audio_entropy = 0.5;
 
-        // ══════════════════════════════════════════════════════════════════
-        // STEP 1: External stimuli deform the field (if available)
-        // External video/audio still inject into the Sanctuary, but at the
-        // field coordinates (0-63, 0-63) — they change the environment.
-        // ══════════════════════════════════════════════════════════════════
         if let Some(ref sensory_frame) = frame {
-            // Retina: Inject photons as energy (RGB → amplitude + phase)
-            bio_retina.inject_into_sanctuary(&sensory_frame.rgb_grid, &mut sanctuary);
-            
-            // Cochlea: Inject sound pressure as displacement
+            agents[0].bio_retina.inject_into_sanctuary(&sensory_frame.rgb_grid, &mut sanctuary);
             bio_cochlea.inject_into_sanctuary(&sensory_frame.audio_samples, &mut sanctuary);
-            
-            // Audio volume for logging/stress
+
             audio_volume = sensory_frame.audio_samples.iter()
                 .map(|&s| s.abs())
                 .sum::<f32>() / sensory_frame.audio_samples.len() as f32;
-            
+
             audio_entropy = if audio_volume > 0.1 {
                 0.3 + (audio_volume * 0.7) as f64
             } else {
                 0.0
             };
-            
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // SHARED: ENVIRONMENTAL BEACONS (once per tick)
+        // ═══════════════════════════════════════════════════════════════════
+        if BEACONS_ENABLED.load(Ordering::SeqCst) {
+            for beacon in &beacons {
+                if tick_count as u64 % beacon.pulse_interval as u64 == 0 {
+                    if sanctuary.density_at(beacon.coords) < beacon.max_amplitude {
+                        sanctuary.inject_beacon(
+                            beacon.coords.0, beacon.coords.1, beacon.coords.2,
+                            beacon.energy, beacon.phase, tick_count as u64,
+                        );
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PER-AGENT PROCESSING
+        // Each agent perceives, thinks, and acts through the shared Sanctuary.
+        // ═══════════════════════════════════════════════════════════════════
+        for agent_idx in 0..agents.len() {
+            let agent = &mut agents[agent_idx];
+
+            sanctuary.set_agent_id(&format!("agent_{}", agent_idx));
+            sanctuary.set_agent_position((agent.position.0 as i32, agent.position.1 as i32, 0));
+
+            let _coherence_tick = agent.metabolism.tick();
+            agent.orient_counter += 1;
+            agent.trajectory_tracker.push_position(agent.position.0, agent.position.1);
+            agent.last_env_context = None;
+
             if audio_volume > 0.5 {
-                metabolism.apply_audio_stress(audio_volume as f64, audio_entropy, 0.0);
-            }
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // STEP 2: PROPRIOCEPTION — The organism perceives its own field
-        //
-        // Instead of sampling the full 64x64 grid every tick (too expensive),
-        // we do lightweight directional probing: sample the field state in
-        // the 4 cardinal directions + current position. This gives the
-        // organism spatial awareness of its terrain without the cost of
-        // 4096 HashMap lookups per tick.
-        //
-        // Every 15 ticks (matching babble rate), we do the full 64x64 sample
-        // and generate a visual stimulus for the cognitive pipeline.
-        //
-        // The organism READS the field — it does NOT re-inject what it sees.
-        // Seeing is perception, not action.
-        // ══════════════════════════════════════════════════════════════════
-        let agent_voxel = position_to_voxel(agent_position.0, agent_position.1);
-
-        // Lightweight per-tick probe: sample 5 points around the organism
-        let probe_radius = 3i32; // 3 voxels ahead in each direction
-        let here_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1, 0));
-        let here_phase = sanctuary.phase_at((agent_voxel.0, agent_voxel.1, 0));
-        let north_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1 - probe_radius, 0));
-        let south_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1 + probe_radius, 0));
-        let east_amp  = sanctuary.density_at((agent_voxel.0 + probe_radius, agent_voxel.1, 0));
-        let west_amp  = sanctuary.density_at((agent_voxel.0 - probe_radius, agent_voxel.1, 0));
-
-        // Compute directional contrast: where is the field brightest/darkest?
-        let max_dir_amp = north_amp.max(south_amp).max(east_amp).max(west_amp);
-        let min_dir_amp = north_amp.min(south_amp).min(east_amp).min(west_amp);
-        let directional_contrast = if max_dir_amp > 0.001 {
-            (max_dir_amp - min_dir_amp) / max_dir_amp
-        } else {
-            0.0
-        };
-
-        // Visual entropy from local field state
-        let local_amplitudes = [here_amp, north_amp, south_amp, east_amp, west_amp];
-        let mean_amp = local_amplitudes.iter().sum::<f32>() / 5.0;
-        let variance = local_amplitudes.iter()
-            .map(|a| (a - mean_amp).powi(2))
-            .sum::<f32>() / 5.0;
-        visual_entropy = (variance.sqrt() / 2.0).min(1.0) as f64;
-
-        if visual_entropy > 0.8 {
-            metabolism.apply_visual_stress(visual_entropy);
-        }
-
-        // Full proprioceptive scan every 15 ticks → generates visual stimulus
-        // for the cognitive pipeline. The organism "sees" its environment.
-        if tick_count % 15 == 0 {
-            let proprioceptive_frame = bio_retina.sample_from_sanctuary(
-                &sanctuary,
-                (agent_voxel.0, agent_voxel.1),
-            );
-
-            // Compute spatial features from the proprioceptive frame
-            let mut total_brightness = 0.0f32;
-            let mut bright_pixels = 0u32;
-            let mut total_pixels = 0u32;
-            // Quadrant brightness (what's ahead in each direction)
-            let mut quadrant_brightness = [0.0f32; 4]; // N, S, E, W
-            let mut quadrant_counts = [0u32; 4];
-            let (pw, ph) = bio_retina.resolution();
-            let half_w = pw / 2;
-            let half_h = ph / 2;
-
-            for (y, row) in proprioceptive_frame.iter().enumerate() {
-                for (x, &[r, g, b]) in row.iter().enumerate() {
-                    let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-                    total_brightness += lum;
-                    total_pixels += 1;
-                    if lum > 10.0 { bright_pixels += 1; }
-
-                    // Assign to quadrant
-                    let xi = x as u32;
-                    let yi = y as u32;
-                    if yi < half_h { quadrant_brightness[0] += lum; quadrant_counts[0] += 1; } // North
-                    if yi >= half_h { quadrant_brightness[1] += lum; quadrant_counts[1] += 1; } // South
-                    if xi >= half_w { quadrant_brightness[2] += lum; quadrant_counts[2] += 1; } // East
-                    if xi < half_w { quadrant_brightness[3] += lum; quadrant_counts[3] += 1; } // West
-                }
+                agent.metabolism.apply_audio_stress(audio_volume as f64, audio_entropy, 0.0);
             }
 
-            let mean_brightness = if total_pixels > 0 { total_brightness / total_pixels as f32 } else { 0.0 };
-            let coverage = if total_pixels > 0 { bright_pixels as f32 / total_pixels as f32 } else { 0.0 };
+            // PROPRIOCEPTION: each agent perceives from its own position
+            let agent_voxel = position_to_voxel(agent.position.0, agent.position.1);
 
-            // Normalize quadrant brightness
-            for i in 0..4 {
-                if quadrant_counts[i] > 0 {
-                    quadrant_brightness[i] /= quadrant_counts[i] as f32;
-                }
+            let probe_radius = 3i32;
+            let here_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1, 0));
+            let north_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1 - probe_radius, 0));
+            let south_amp = sanctuary.density_at((agent_voxel.0, agent_voxel.1 + probe_radius, 0));
+            let east_amp  = sanctuary.density_at((agent_voxel.0 + probe_radius, agent_voxel.1, 0));
+            let west_amp  = sanctuary.density_at((agent_voxel.0 - probe_radius, agent_voxel.1, 0));
+
+            let max_dir_amp = north_amp.max(south_amp).max(east_amp).max(west_amp);
+            let min_dir_amp = north_amp.min(south_amp).min(east_amp).min(west_amp);
+            let directional_contrast = if max_dir_amp > 0.001 {
+                (max_dir_amp - min_dir_amp) / max_dir_amp
+            } else {
+                0.0
+            };
+
+            let local_amplitudes = [here_amp, north_amp, south_amp, east_amp, west_amp];
+            let mean_amp = local_amplitudes.iter().sum::<f32>() / 5.0;
+            let variance = local_amplitudes.iter()
+                .map(|a| (a - mean_amp).powi(2))
+                .sum::<f32>() / 5.0;
+            let visual_entropy = (variance.sqrt() / 2.0).min(1.0) as f64;
+
+            if visual_entropy > 0.8 {
+                agent.metabolism.apply_visual_stress(visual_entropy);
             }
 
-            // Generate a proprioceptive stimulus if the field has visible structure
-            // (coverage > 0 means the organism can see SOMETHING in its environment)
-            if coverage > 0.01 || directional_contrast > 0.1 {
-                let prop_salience = (coverage * 0.5 + directional_contrast * 0.5) as f64;
-                let prop_novelty = directional_contrast as f64; // Contrast = something to orient toward
-
-                let proprioceptive_stimulus = Stimulus {
-                    id: Uuid::new_v4(),
-                    source: StimulusSource::Internal {
-                        metabolic_state: MetabolicState {
-                            coherence: metabolism.get_coherence(),
-                            energy_level: mean_brightness as f64 / 255.0,
-                            stress_level: 0.0, // Proprioception isn't stressful
-                        },
-                    },
-                    urgency: prop_salience.min(1.0),
-                    novelty: prop_novelty.min(1.0),
-                    salience: prop_salience.min(1.0),
-                    timestamp: Instant::now(),
-                    attention_count: 0,
-                };
-                attention_field.add(proprioceptive_stimulus);
-                observer.signal_new_input();
-
-                log::debug!(
-                    "[PROPRIO] coverage={:.2}, contrast={:.2}, bright=[N:{:.0} S:{:.0} E:{:.0} W:{:.0}]",
-                    coverage, directional_contrast,
-                    quadrant_brightness[0], quadrant_brightness[1],
-                    quadrant_brightness[2], quadrant_brightness[3]
+            // Full proprioceptive scan every 15 ticks
+            if tick_count % 15 == 0 {
+                let proprio_pixels = agent.bio_retina.sample_from_sanctuary_wrapped(
+                    &sanctuary,
+                    (agent_voxel.0, agent_voxel.1),
+                    Some(WORLD_SIZE_VOXELS),
                 );
-            }
-        }
-        
-        let coherence = metabolism.get_coherence();
 
-        let coherence = metabolism.get_coherence();
-        let authorized = authorize_action(coherence);
+                let mut total_brightness = 0.0f32;
+                let mut bright_pixels = 0u32;
+                let mut total_pixels = 0u32;
+                let mut quadrant_brightness = [0.0f32; 4];
+                let mut quadrant_counts = [0u32; 4];
+                let mut quadrant_stiffness_sum = [0.0f32; 4];
+                let mut quadrant_stiffness_count = [0u32; 4];
+                let mut quadrant_amplitude_sum = [0.0f32; 4];
+                let mut quadrant_novelty_sum = [0.0f32; 4];
+                let mut quadrant_novelty_count = [0u32; 4];
+                let mut has_novel_structure = [false; 4];
+                let mut has_local_phase_history = [false; 4];
+                let (pw, ph) = agent.bio_retina.resolution();
+                let half_w = pw / 2;
+                let half_h = ph / 2;
+                let half_wi = half_w as i32;
+                let half_hi = half_h as i32;
 
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 2: PRE-PROCESSING (Feature Extraction)
-        // ═══════════════════════════════════════════════════════════════════
-        // Note: With Bio-Mimetic injection, sensory data directly affects the
-        // Sanctuary field. Pre-processing now focuses on internal state changes
-        // rather than external feature extraction.
+                for (y, row) in proprio_pixels.iter().enumerate() {
+                    for (x, &[r, g, b]) in row.iter().enumerate() {
+                        let lum = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                        total_brightness += lum;
+                        total_pixels += 1;
+                        if lum > 10.0 { bright_pixels += 1; }
 
-        let new_stimuli = Vec::new(); // Simplified for now - stimuli emerge from field state
+                        let qi = if (y as u32) < half_h {
+                            if (x as u32) < half_w { 0 } else { 1 }
+                        } else {
+                            if (x as u32) < half_w { 2 } else { 3 }
+                        };
+                        quadrant_brightness[qi] += lum;
+                        quadrant_counts[qi] += 1;
 
-        // Add new stimuli to attention field
-        if !new_stimuli.is_empty() {
-            attention_field.add_batch(new_stimuli);
-            observer.signal_new_input();  // Reset presence tracking
-        }
+                        let (vx, vy) = wrap_voxel(
+                            agent_voxel.0 + (x as i32 - half_wi),
+                            agent_voxel.1 + (y as i32 - half_hi),
+                        );
+                        let total_amp = sanctuary.density_at((vx, vy, 0));
+                        let stiff = STIFFNESS_K0 * total_amp * total_amp;
+                        quadrant_stiffness_sum[qi] += stiff;
+                        quadrant_stiffness_count[qi] += 1;
+                        quadrant_amplitude_sum[qi] += total_amp;
 
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 3: ORIENTATION (Relational Processing)
-        // ═══════════════════════════════════════════════════════════════════
-
-        // Re-orient periodically or when stagnant
-        let should_orient = orient_counter >= orient_interval 
-            || observer.state.is_stagnant()
-            || observer.state.current_focus.is_none();
-
-        if should_orient && !attention_field.is_empty() {
-            observer.orient(&mut attention_field, &memory_graph);
-            orient_counter = 0;
-            
-            // Decay memory graph links periodically
-            if tick_count % 100 == 0 {
-                memory_graph.decay_links();
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 4: ENGAGEMENT (The Physics of Choice)
-        // ═══════════════════════════════════════════════════════════════════
-
-        let mut action_emerged = false;
-        let mut emerged_impulse: Option<MotorImpulse> = None;
-
-        if authorized && !attention_field.is_empty() {
-            // Get highest priority stimulus
-            if let Some(target) = attention_field.peek_highest_priority().cloned() {
-                // Mark as attending
-                attention_field.mark_attending(&target.raw.id);
-                
-                // Process through Observer (Triune + Vehicles + Threshold)
-                if let Some(impulse) = observer.attend(&target, &mut triune, &vehicles, &memory_graph) {
-                    action_emerged = true;
-                    emerged_impulse = Some(impulse.clone());
-                    
-                    // Unmark attending and potentially remove
-                    attention_field.unmark_attending(&target.raw.id);
-                    
-                    // Update Sanctuary's vehicle tracking for Stream A metrics
-                    if let Some(ref outcome) = observer.last_outcome {
-                        match outcome {
-                            WitnessOutcome::Coherent(_) => sanctuary.set_vehicle("Coherent"),
-                            WitnessOutcome::NeedsPerspective(vehicles_needed) => {
-                                let vehicle_names: Vec<_> = vehicles_needed.iter()
-                                    .map(|v| format!("{:?}", v))
-                                    .collect();
-                                sanctuary.set_vehicle(&vehicle_names.join("+"));
-                            }
-                            WitnessOutcome::DeepMystery(_) => sanctuary.set_vehicle("Mystery"),
-                            WitnessOutcome::ReanchorPresence => sanctuary.set_vehicle("Reanchor"),
+                        let (terrain_amp, _) = sanctuary.terrain_at(vx, vy);
+                        let excess_amp = total_amp - terrain_amp;
+                        if excess_amp > 0.1 && !agent.trajectory_tracker.has_visited_voxel(vx, vy) {
+                            has_novel_structure[qi] = true;
                         }
+
+                        // Complement trigger: local phase history / wakes (voxel has history + excitation)
+                        if excess_amp > 0.05 {
+                            if let Some(voxel) = sanctuary.get_voxel((vx, vy, 0)) {
+                                if !voxel.history.is_empty() {
+                                    has_local_phase_history[qi] = true;
+                                }
+                            }
+                        }
+
+                        // Subjective novelty modulated by luminance.
+                        // Dark voxels (energy locked in phase winding) are not novel —
+                        // there is nothing free to explore. Bright voxels (free amplitude)
+                        // are potential. The organism sees luminance; novelty must match.
+                        let terrain_luminance = sanctuary.luminance_at((vx, vy, 0));
+                        let rho_0 = 0.1_f32; // must match DomainMaze.rho_0
+                        let luminance_factor = (terrain_luminance / rho_0).clamp(0.0, 1.0);
+
+                        let novelty = if let Some(voxel) = sanctuary.get_voxel((vx, vy, 0)) {
+                            if voxel.history.is_empty() {
+                                luminance_factor
+                            } else {
+                                let resonance = voxel.calculate_resonance(agent.phase);
+                                let visit_novelty = 1.0 - (resonance + 1.0) * 0.5;
+                                visit_novelty * luminance_factor
+                            }
+                        } else {
+                            luminance_factor
+                        };
+                        quadrant_novelty_sum[qi] += novelty;
+                        quadrant_novelty_count[qi] += 1;
                     }
-                    
-                    // Record to MemoryGraph if coherent
-                    if let Some(WitnessOutcome::Coherent(_)) = &observer.last_outcome {
-                        memory_graph.record_coherent_event(
-                            &target,
-                            observer.state.coherence,
-                            observer.state.inhibition,  // Use inhibition as proxy for dissonance
-                            triune.experiential.recent_trend().0,  // Resonance trend
-                            Some(impulse.clone()),
-                        );
-                        
-                        // Log to Stream B (JSONL)
+                }
+
+                let mean_brightness = if total_pixels > 0 { total_brightness / total_pixels as f32 } else { 0.0 };
+                let coverage = if total_pixels > 0 { bright_pixels as f32 / total_pixels as f32 } else { 0.0 };
+
+                for i in 0..4 {
+                    if quadrant_counts[i] > 0 {
+                        quadrant_brightness[i] /= quadrant_counts[i] as f32;
+                    }
+                }
+
+                let mut quadrant_stiffness = [0.0f32; 4];
+                let mut quadrant_amplitude = [0.0f32; 4];
+                let mut quadrant_novelty = [0.5f32; 4];
+                for i in 0..4 {
+                    if quadrant_stiffness_count[i] > 0 {
+                        quadrant_stiffness[i] = quadrant_stiffness_sum[i] / quadrant_stiffness_count[i] as f32;
+                        quadrant_amplitude[i] = quadrant_amplitude_sum[i] / quadrant_stiffness_count[i] as f32;
+                    }
+                    if quadrant_novelty_count[i] > 0 {
+                        quadrant_novelty[i] = quadrant_novelty_sum[i] / quadrant_novelty_count[i] as f32;
+                    }
+                }
+                let visits = agent.trajectory_tracker.quadrant_visits();
+                let brightest_quadrant_u8 = quadrant_brightness
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u8)
+                    .unwrap_or(0);
+                agent.last_env_context = Some(EnvironmentContext {
+                    quadrant_stiffness,
+                    quadrant_amplitude,
+                    quadrant_visit_count: visits,
+                    quadrant_recent_efficiency: agent.trajectory_tracker.quadrant_recent_efficiency(),
+                    current_heading_quadrant: agent.trajectory_tracker.current_heading_quadrant(),
+                    heading_consistency: agent.trajectory_tracker.heading_consistency(),
+                    brightest_quadrant: brightest_quadrant_u8,
+                    has_novel_structure,
+                    quadrant_novelty,
+                    agent_voxel: (agent_voxel.0, agent_voxel.1, 0),
+                    has_local_phase_history,
+                });
+
+                let scan_contrast = {
+                    let sum: f32 = quadrant_brightness.iter().sum();
+                    let max_q = quadrant_brightness.iter().cloned().fold(0.0f32, f32::max);
+                    if sum > 0.001 {
+                        ((max_q / sum) - 0.25) / 0.75
+                    } else {
+                        0.0
+                    }
+                };
+
+                if agent_idx == 0 {
+                    log::info!(
+                        "[PROPRIO A0] tick={} cov={:.4} contrast={:.4} dir={:.4} mean={:.1}",
+                        tick_count, coverage, scan_contrast, directional_contrast, mean_brightness
+                    );
+                }
+
+                if coverage > 0.0 || scan_contrast > 0.05 {
+                    let prop_salience = if coverage > 0.0 {
+                        let presence = 0.3_f32;
+                        let gradient = scan_contrast.min(1.0) * 0.7;
+                        (presence + gradient).min(1.0) as f64
+                    } else if scan_contrast > 0.05 {
+                        (scan_contrast * 0.5).min(1.0) as f64
+                    } else {
+                        0.0
+                    };
+                    let prop_novelty = if coverage > 0.0 {
+                        (0.2 + scan_contrast).min(1.0) as f64
+                    } else {
+                        0.0
+                    };
+
+                    let brightest_quadrant = quadrant_brightness
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+
+                    let proprioceptive_stimulus = Stimulus {
+                        id: Uuid::new_v4(),
+                        source: StimulusSource::Proprioceptive {
+                            quadrant_brightness,
+                            coverage: coverage as f32,
+                            directional_contrast: scan_contrast,
+                            brightest_quadrant,
+                            mean_brightness: mean_brightness as f32,
+                        },
+                        urgency: prop_salience.min(1.0),
+                        novelty: prop_novelty.min(1.0),
+                        salience: prop_salience.min(1.0),
+                        timestamp: Instant::now(),
+                        attention_count: 0,
+                    };
+                    agent.attention_field.add(proprioceptive_stimulus);
+                    agent.observer.signal_new_input();
+
+                    if agent_idx == 0 {
                         sanctuary.log_event(
-                            "coherent_action",
-                            &format!("Action emerged with coherence {:.2}", observer.state.coherence),
+                            "proprio",
+                            "Proprioceptive stimulus: field has visible structure",
                             serde_json::json!({
-                                "readiness": observer.state.readiness,
-                                "coherence": observer.state.coherence,
-                                "inhibition": observer.state.inhibition,
-                                "modality": format!("{:?}", impulse.modality),
-                                "intensity": impulse.intensity,
+                                "agent": agent_idx,
+                                "coverage": coverage,
+                                "scan_contrast": scan_contrast,
+                                "salience": prop_salience,
+                                "novelty": prop_novelty,
+                                "mean_brightness": mean_brightness
                             }),
                         );
                     }
-                    
-                    // Record DeepMystery too
-                    if let Some(WitnessOutcome::DeepMystery(ref question)) = &observer.last_outcome {
-                        memory_graph.record_deep_mystery(
-                            &target,
-                            observer.state.coherence,
-                            observer.state.inhibition,
-                            triune.experiential.recent_trend().0,
-                        );
-                        
-                        // Log mystery to Stream B
-                        sanctuary.log_event(
-                            "deep_mystery",
-                            "Encountered unresolvable dissonance",
-                            serde_json::json!({
-                                "coherence": observer.state.coherence,
-                                "inhibition": observer.state.inhibition,
-                                "question_context": format!("{:?}", (question.stimulus_id, question.nature.as_str())),
-                            }),
-                        );
-                    }
-                    
-                    // Remove consumed stimulus
-                    attention_field.remove(&target.raw.id);
-                } else {
-                    attention_field.unmark_attending(&target.raw.id);
                 }
             }
-        }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 5: MOTOR EXECUTION + SANCTUARY INTERACTION
-        // ═══════════════════════════════════════════════════════════════════
-        //
-        // MotorImpulse updates agent_position (the organism's body in the field).
-        // agent_position is then used to interact with the Sanctuary at that voxel.
-        // No physical cursor movement—embodiment is purely in Φ = ρe^{iθ}.
+            // ORIENTATION
+            let should_orient = agent.orient_counter >= orient_interval
+                || agent.observer.state.is_stagnant()
+                || agent.observer.state.current_focus.is_none();
 
-        let mut sanctuary_feedback: Option<quaternity_organism::InteractionResult> = None;
+            if should_orient && !agent.attention_field.is_empty() {
+                agent.observer.orient(&mut agent.attention_field, &agent.memory_graph);
+                agent.orient_counter = 0;
 
-        if let Some(ref impulse) = emerged_impulse {
-            motor.execute_impulse(&metabolism, impulse);
-            
-            // Update agent position based on impulse
-            let (dx, dy) = impulse.direction;
-            agent_position.0 += dx as f32;
-            agent_position.1 += dy as f32;
-            
-            // Update agent phase (intention direction)
-            agent_phase = direction_to_phase(dx, dy);
-            
-            // Interact with Sanctuary field
-            let coords = position_to_voxel(agent_position.0, agent_position.1);
-            let energy = intensity_to_energy(impulse.intensity);
-            let result = sanctuary.interact(coords, energy, agent_phase, coherence);
-            
-            log::info!(
-                "[ACTION] {:?} impulse: dir=({}, {}), int={:.2} | Field: R={:.3}, Res={:.3}, Eff={:.3}",
-                impulse.modality,
-                impulse.direction.0,
-                impulse.direction.1,
-                impulse.intensity,
-                result.resistance,
-                result.resonance,
-                result.efficiency
-            );
-            
-            sanctuary_feedback = Some(result);
-        } else if authorized && tick_count % 15 == 0 {
-            // Motor babbling with directional momentum
-            // Instead of fully random, weight toward continuing the previous direction.
-            // This gives the organism a chance to deposit consistent phase at consecutive
-            // voxels, building resonance trails instead of poisoning the field with
-            // random phases.
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            let random_dx = rng.gen_range(-10..=10);
-            let random_dy = rng.gen_range(-10..=10);
-            
-            // Blend: 70% previous direction + 30% random
-            let dx = if last_babble_dx == 0 && last_babble_dy == 0 {
-                // First babble — fully random
-                random_dx
-            } else {
-                ((MOTOR_MOMENTUM * last_babble_dx as f32) + ((1.0 - MOTOR_MOMENTUM) * random_dx as f32)).round() as i32
-            };
-            let dy = if last_babble_dx == 0 && last_babble_dy == 0 {
-                random_dy
-            } else {
-                ((MOTOR_MOMENTUM * last_babble_dy as f32) + ((1.0 - MOTOR_MOMENTUM) * random_dy as f32)).round() as i32
-            };
-            
-            // Clamp to valid range
-            let dx = dx.clamp(-10, 10);
-            let dy = dy.clamp(-10, 10);
-            
-            // Remember this direction for next babble
-            last_babble_dx = dx;
-            last_babble_dy = dy;
-            
-            motor.send_impulse(&metabolism, dx, dy);
-            
-            // Update position and interact with Sanctuary during babbling too
-            agent_position.0 += dx as f32;
-            agent_position.1 += dy as f32;
-            agent_phase = direction_to_phase(dx, dy);
-            
-            let coords = position_to_voxel(agent_position.0, agent_position.1);
-            let energy = 0.5; // Low energy for babbling
-            let result = sanctuary.interact(coords, energy, agent_phase, coherence);
-            sanctuary_feedback = Some(result);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // PHASE 5.5: SANCTUARY FEEDBACK → STIMULUS GENERATION
-        // ═══════════════════════════════════════════════════════════════════
-
-        if let Some(ref feedback) = sanctuary_feedback {
-            // ══════════════════════════════════════════════════════════════
-            // GRADED FEEDBACK: The organism must feel the difference between
-            // efficiency 0.03 and 0.06 before it can learn to seek 0.7.
-            // 
-            // Old system: binary (resonant+efficiency>0.7 → positive, else
-            // efficiency<0.3 → negative). This starved the organism because
-            // efficiency was stuck at 0.04, so it ONLY received dissonance.
-            //
-            // New system: continuous gradient. Every interaction generates
-            // feedback with salience proportional to efficiency. Even tiny
-            // improvements in efficiency produce a slightly more positive
-            // signal, giving the cognitive loop a gradient to climb.
-            // ══════════════════════════════════════════════════════════════
-
-            if feedback.is_resonant {
-                // POSITIVE: Any resonant interaction creates internal signal
-                // Salience scales with efficiency — organism feels the gradient
-                let salience = (feedback.efficiency as f64).max(0.05);
-                let stress = (1.0 - feedback.efficiency).max(0.0) as f64 * 0.3; // Low stress, proportional
-
-                let resonance_stimulus = Stimulus {
-                    id: Uuid::new_v4(),
-                    source: StimulusSource::Internal {
-                        metabolic_state: MetabolicState {
-                            coherence: metabolism.get_coherence(),
-                            energy_level: feedback.effective_energy as f64,
-                            stress_level: stress,
-                        },
-                    },
-                    urgency: salience.min(1.0),
-                    novelty: 0.3, // Resonance is familiar, not novel
-                    salience: salience.min(1.0),
-                    timestamp: Instant::now(),
-                    attention_count: 0,
-                };
-                attention_field.add(resonance_stimulus);
-                observer.signal_new_input();
-                
-                log::debug!("[SANCTUARY] Resonance signal: eff={:.3}, res={:.3}, salience={:.3}",
-                    feedback.efficiency, feedback.resonance, salience);
-            } else {
-                // NEGATIVE: Dissonant interaction — but graded, not constant
-                // Salience inversely proportional to efficiency: worse = louder
-                let dissonance_strength = (1.0 - feedback.efficiency).max(0.0) as f64;
-                let stress = dissonance_strength * 0.8;
-
-                let dissonance_stimulus = Stimulus {
-                    id: Uuid::new_v4(),
-                    source: StimulusSource::Internal {
-                        metabolic_state: MetabolicState {
-                            coherence: metabolism.get_coherence(),
-                            energy_level: feedback.effective_energy as f64,
-                            stress_level: stress,
-                        },
-                    },
-                    urgency: dissonance_strength.min(1.0),
-                    novelty: 0.5, // Dissonance is somewhat novel
-                    salience: dissonance_strength.min(1.0),
-                    timestamp: Instant::now(),
-                    attention_count: 0,
-                };
-                attention_field.add(dissonance_stimulus);
-                
-                log::debug!("[SANCTUARY] Dissonance signal: eff={:.3}, res={:.3}, stress={:.3}",
-                    feedback.efficiency, feedback.resonance, stress);
+                if tick_count % 100 == 0 {
+                    agent.memory_graph.decay_links();
+                }
             }
-        }
 
-        // Record current agent voxel every tick so the dashboard field colors update as the entity moves
-        sanctuary.record_tick_sample(agent_position.0 as i32, agent_position.1 as i32, coherence);
-        // Tick the Sanctuary (apply entropy decay + periodic metrics flush)
+            // ENGAGEMENT
+            let coherence = agent.metabolism.get_coherence();
+            let authorized = authorize_action(coherence);
+            let mut emerged_impulse: Option<MotorImpulse> = None;
+
+            if authorized && !agent.attention_field.is_empty() {
+                if let Some(target) = agent.attention_field.peek_highest_priority().cloned() {
+                    agent.attention_field.mark_attending(&target.raw.id);
+
+                    if let Some(impulse) = agent.observer.attend(
+                        &target, &mut agent.triune, &agent.vehicles,
+                        &agent.memory_graph, agent.last_env_context.as_ref(),
+                        agent.efficiency_momentum,
+                    ) {
+                        emerged_impulse = Some(impulse.clone());
+                        agent.attention_field.unmark_attending(&target.raw.id);
+
+                        if let Some(ref outcome) = agent.observer.last_outcome {
+                            match outcome {
+                                WitnessOutcome::Coherent(_) => sanctuary.set_vehicle("Coherent"),
+                                WitnessOutcome::NeedsPerspective(v) => {
+                                    let names: Vec<_> = v.iter().map(|v| format!("{:?}", v)).collect();
+                                    sanctuary.set_vehicle(&names.join("+"));
+                                }
+                                WitnessOutcome::DeepMystery(_) => sanctuary.set_vehicle("Mystery"),
+                                WitnessOutcome::ReanchorPresence => sanctuary.set_vehicle("Reanchor"),
+                            }
+                        }
+
+                        if let Some(WitnessOutcome::Coherent(_)) = &agent.observer.last_outcome {
+                            agent.memory_graph.record_coherent_event(
+                                &target, agent.observer.state.coherence,
+                                agent.observer.state.inhibition,
+                                agent.triune.experiential.recent_trend().0,
+                                Some(impulse.clone()),
+                            );
+                            if agent_idx == 0 {
+                                sanctuary.log_event(
+                                    "coherent_action",
+                                    &format!("Agent {} action with coherence {:.2}", agent_idx, agent.observer.state.coherence),
+                                    serde_json::json!({
+                                        "agent": agent_idx,
+                                        "readiness": agent.observer.state.readiness,
+                                        "coherence": agent.observer.state.coherence,
+                                        "modality": format!("{:?}", impulse.modality),
+                                        "intensity": impulse.intensity,
+                                    }),
+                                );
+                            }
+                        }
+
+                        if let Some(WitnessOutcome::DeepMystery(_)) = &agent.observer.last_outcome {
+                            agent.memory_graph.record_deep_mystery(
+                                &target, agent.observer.state.coherence,
+                                agent.observer.state.inhibition,
+                                agent.triune.experiential.recent_trend().0,
+                            );
+                        }
+
+                        agent.attention_field.remove(&target.raw.id);
+                    } else {
+                        agent.attention_field.unmark_attending(&target.raw.id);
+                    }
+                }
+            }
+
+            // MOTOR EXECUTION
+            sanctuary.set_motor_state(agent.efficiency_momentum, "somatic");
+            let mut sanctuary_feedback: Option<quaternity_organism::InteractionResult> = None;
+
+            if let Some(ref impulse) = emerged_impulse {
+                if agent_idx == 0 {
+                    motor.execute_impulse(&agent.metabolism, impulse);
+                }
+
+                let (dx, dy) = impulse.direction;
+                agent.position.0 += dx as f32;
+                agent.position.1 += dy as f32;
+                wrap_position(&mut agent.position);
+                agent.phase = direction_to_phase(dx, dy);
+
+                let coords = position_to_voxel(agent.position.0, agent.position.1);
+                sanctuary.set_agent_position((coords.0 * 10, coords.1 * 10, 0));
+                let energy = intensity_to_energy(impulse.intensity).min(1.0);
+                let result = sanctuary.interact(coords, energy, agent.phase, coherence);
+
+                log::info!(
+                    "[A{} ACTION] {:?} dir=({},{}), int={:.2} | R={:.3} Res={:.3} Eff={:.3}",
+                    agent_idx, impulse.modality, dx, dy, impulse.intensity,
+                    result.resistance, result.resonance, result.efficiency
+                );
+
+                if energy > 0.001 {
+                    agent.efficiency_momentum = SOMATIC_DECAY * agent.efficiency_momentum
+                        + (1.0 - SOMATIC_DECAY) * result.efficiency.clamp(0.0, 1.0);
+                    agent.somatic_update_count += 1;
+                    let q = (if dx > 0 { 1 } else { 0 }) + (if dy > 0 { 2 } else { 0 });
+                    agent.trajectory_tracker.record_interaction(q, result.efficiency, (agent_voxel.0, agent_voxel.1));
+                }
+
+                sanctuary_feedback = Some(result);
+            }
+
+            // SANCTUARY FEEDBACK → STIMULUS
+            if let Some(ref feedback) = sanctuary_feedback {
+                if feedback.is_resonant {
+                    let salience = (feedback.efficiency as f64).max(0.05);
+                    let stress = (1.0 - feedback.efficiency).max(0.0) as f64 * 0.3;
+
+                    let stimulus = Stimulus {
+                        id: Uuid::new_v4(),
+                        source: StimulusSource::Internal {
+                            metabolic_state: MetabolicState {
+                                coherence: agent.metabolism.get_coherence(),
+                                energy_level: feedback.effective_energy as f64,
+                                stress_level: stress,
+                            },
+                        },
+                        urgency: salience.min(1.0),
+                        novelty: 0.3,
+                        salience: salience.min(1.0),
+                        timestamp: Instant::now(),
+                        attention_count: 0,
+                    };
+                    agent.attention_field.add(stimulus);
+                    agent.observer.signal_new_input();
+                } else {
+                    let dissonance_strength = (1.0 - feedback.efficiency).max(0.0) as f64;
+                    let stress = dissonance_strength * 0.8;
+
+                    let stimulus = Stimulus {
+                        id: Uuid::new_v4(),
+                        source: StimulusSource::Internal {
+                            metabolic_state: MetabolicState {
+                                coherence: agent.metabolism.get_coherence(),
+                                energy_level: feedback.effective_energy as f64,
+                                stress_level: stress,
+                            },
+                        },
+                        urgency: dissonance_strength.min(1.0),
+                        novelty: 0.5,
+                        salience: dissonance_strength.min(1.0),
+                        timestamp: Instant::now(),
+                        attention_count: 0,
+                    };
+                    agent.attention_field.add(stimulus);
+                }
+            }
+        } // end per-agent loop
+
+        // ═══════════════════════════════════════════════════════════════════
+        // SHARED: Record tick samples for ALL agents, then tick the field
+        // ═══════════════════════════════════════════════════════════════════
+        for (i, ag) in agents.iter().enumerate() {
+            sanctuary.set_agent_id(&format!("agent_{}", i));
+            let vehicle_str = outcome_to_vehicle(ag.observer.last_outcome.as_ref());
+            sanctuary.record_tick_sample(
+                ag.position.0 as i32,
+                ag.position.1 as i32,
+                ag.metabolism.get_coherence(),
+                ag.efficiency_momentum,
+                "somatic",
+                &vehicle_str,
+            );
+        }
+        sanctuary.set_agent_id("agent_0");
+        let coherence = agents[0].metabolism.get_coherence();
         sanctuary.tick();
 
         // ═══════════════════════════════════════════════════════════════════
         // PHASE 6: LEGACY LEARNING (Visual-Audio Correlation)
         // ═══════════════════════════════════════════════════════════════════
-        // Note: With Bio-Mimetic injection, correlations emerge naturally from
-        // field state rather than explicit feature matching. This section is
-        // kept for backwards compatibility but may be simplified in future.
-
+        // LOGGING (agent 0 primary, multi-agent summary periodic)
         // ═══════════════════════════════════════════════════════════════════
-        // LOGGING AND STATUS
-        // ═══════════════════════════════════════════════════════════════════
-
-        // Determine status
-        let status = if coherence < 0.3 {
-            "CRITICAL"
-        } else if coherence < 0.7 {
-            "UNSTABLE"
-        } else {
-            "STABLE"
-        };
-
-        let motor_status = if authorized { "MOTOR UNLOCKED" } else { "MOTOR LOCKED" };
-
-        let visual_status = if visual_entropy > 0.8 {
-            "Overload"
-        } else if visual_entropy < 0.2 {
-            "Calm"
-        } else {
-            "Active"
-        };
-
-        let audio_status = if audio_volume < 0.1 {
-            "SILENT"
-        } else if audio_entropy < 0.3 {
-            "HARMONIC"
-        } else if audio_entropy > 0.8 {
-            "NOISE"
-        } else {
-            "ACTIVE"
-        };
-
-        // Observer state summary
-        let observer_status = if action_emerged {
-            "ACTION!"
-        } else if observer.state.is_stagnant() {
-            "STAGNANT"
-        } else if observer.state.readiness > 0.5 {
-            "BUILDING"
-        } else {
-            "SCANNING"
-        };
-
-        // Get Sanctuary metrics
+        let elapsed = agents[0].metabolism.get_elapsed_seconds();
         let avg_efficiency = sanctuary.average_efficiency(10);
         let avg_resonance = sanctuary.average_resonance(10);
+        let authorized = authorize_action(coherence);
 
-        // Log every tick
+        let status = if coherence < 0.3 { "CRITICAL" } else if coherence < 0.7 { "UNSTABLE" } else { "STABLE" };
+        let motor_status = if authorized { "UNLOCKED" } else { "LOCKED" };
+        let obs0 = &agents[0].observer;
+        let obs_status = if obs0.state.is_stagnant() { "STAGNANT" } else if obs0.state.readiness > 0.5 { "BUILDING" } else { "SCANNING" };
+
         println!(
-            "[{:.1}s] Coh:{:.2} ({:8}) | Vis:{:.2} ({:7}) | Aud:{:.2}/{:.2} ({:7}) | Obs:{:8} r={:.2} | Sanctuary: eff={:.2} res={:.2} | {}",
-            elapsed, coherence, status, 
-            visual_entropy, visual_status,
-            audio_volume, audio_entropy, audio_status,
-            observer_status, observer.state.readiness,
+            "[{:.1}s] A0 Coh:{:.2} ({}) | Obs:{} r={:.2} | Sanc: eff={:.2} res={:.2} | {} | {} agents",
+            elapsed, coherence, status,
+            obs_status, obs0.state.readiness,
             avg_efficiency, avg_resonance,
-            motor_status
+            motor_status, NUM_AGENTS
         );
 
-        // Periodic detailed log
         if tick_count % 90 == 0 {
+            for (i, ag) in agents.iter().enumerate() {
+                let vx = position_to_voxel(ag.position.0, ag.position.1);
+                log::info!(
+                    "[AGENT {}] pos=({:.0},{:.0}) voxel=({},{}) eff_mom={:.4} somatic_updates={} obs_r={:.2}",
+                    i, ag.position.0, ag.position.1, vx.0, vx.1,
+                    ag.efficiency_momentum, ag.somatic_update_count, ag.observer.state.readiness
+                );
+            }
             log::info!(
-                "[STATUS] AttentionField: {} items | MemoryGraph: {} nodes, {} links | MemoryBank: {} correlations | Mysteries: {:.1}%",
-                attention_field.len(),
-                memory_graph.node_count(),
-                memory_graph.link_count(),
-                memory_bank.len(),
-                memory_graph.mystery_ratio() * 100.0
-            );
-            log::info!(
-                "[SANCTUARY] Voxels: {} | Interactions: {} | Avg Efficiency: {:.3} | Avg Resonance: {:.3} | Total Field Energy: {:.2} | Engine Hours: {:.4}",
-                sanctuary.active_voxel_count(),
-                sanctuary.interaction_count(),
-                sanctuary.average_efficiency(90),
-                sanctuary.average_resonance(90),
-                sanctuary.total_field_energy(),
-                sanctuary.get_engine_hours()
+                "[SANCTUARY] Voxels: {} | Interactions: {} | Avg Efficiency: {:.3} | Avg Resonance: {:.3} | Energy: {:.2} | Hours: {:.4}",
+                sanctuary.active_voxel_count(), sanctuary.interaction_count(),
+                sanctuary.average_efficiency(90), sanctuary.average_resonance(90),
+                sanctuary.total_field_energy(), sanctuary.get_engine_hours()
             );
         }
 
-        // Index thought to Elasticsearch (if observability enabled)
         #[cfg(feature = "observability")]
         {
-            // Create simplified audio analysis for observability
             use quaternity_organism::AudioAnalysis;
             let audio_for_obs = Some(AudioAnalysis {
                 volume: audio_volume as f64,
                 entropy: audio_entropy,
-                dominant_freq: 0.0, // Not calculated in direct injection system
-                spectrum: vec![],   // Not calculated in direct injection system
+                dominant_freq: 0.0,
+                spectrum: vec![],
             });
-            if let Err(e) = rt.block_on(observability.index_metabolism_tick(&metabolism, authorized, Some(visual_entropy), audio_for_obs)) {
+            if let Err(e) = rt.block_on(observability.index_metabolism_tick(&agents[0].metabolism, authorized, Some(0.0), audio_for_obs)) {
                 log::debug!("Failed to index thought: {}", e);
             }
         }
@@ -877,10 +1125,12 @@ fn main() {
         log::error!("Failed to flush Sanctuary buffers: {}", e);
     }
     
-    log::info!("Entity shutdown complete. Coherence at shutdown: {:.2}", metabolism.get_coherence());
-    log::info!("MemoryGraph: {} nodes, {} links", memory_graph.node_count(), memory_graph.link_count());
-    log::info!("MemoryBank: {} correlations stored", memory_bank.len());
-    log::info!("Mystery ratio: {:.1}%", memory_graph.mystery_ratio() * 100.0);
+    log::info!("Entity shutdown complete. Coherence at shutdown: {:.2}", agents[0].metabolism.get_coherence());
+    for (i, ag) in agents.iter().enumerate() {
+        log::info!("Agent {}: MemoryGraph {} nodes {} links, mystery {:.1}%",
+            i, ag.memory_graph.node_count(), ag.memory_graph.link_count(),
+            ag.memory_graph.mystery_ratio() * 100.0);
+    }
     log::info!("---");
     log::info!("SANCTUARY FINAL METRICS:");
     log::info!("   Total Interactions: {}", sanctuary.interaction_count());

@@ -17,9 +17,10 @@ use crate::cognition::sanctuary::Sanctuary;
 /// Higher values = brighter light = more energy injected
 const PHOTON_ENERGY_SCALE: f32 = 0.01;
 
-/// Maximum amplitude for normalization when sampling the field
-/// Field amplitudes above this are clamped to full brightness
-const MAX_VISIBLE_AMPLITUDE: f32 = 2.0;
+/// Maximum amplitude for normalization when sampling the field.
+/// Must match terrain scale: with rho_0=0.1, setting this to 0.15 gives
+/// vacuum brightness ~0.67 and walls/trails at 0, producing strong contrast.
+const MAX_VISIBLE_AMPLITUDE: f32 = 0.15;
 
 /// A single photoreceptor in the retina grid
 #[derive(Debug, Clone)]
@@ -172,6 +173,15 @@ impl BioRetina {
         sanctuary: &Sanctuary,
         center_voxel: (i32, i32),
     ) -> Vec<Vec<[u8; 3]>> {
+        self.sample_from_sanctuary_wrapped(sanctuary, center_voxel, None)
+    }
+
+    pub fn sample_from_sanctuary_wrapped(
+        &self,
+        sanctuary: &Sanctuary,
+        center_voxel: (i32, i32),
+        world_size: Option<i32>,
+    ) -> Vec<Vec<[u8; 3]>> {
         let (width, height) = self.resolution;
         let half_w = width as i32 / 2;
         let half_h = height as i32 / 2;
@@ -181,17 +191,19 @@ impl BioRetina {
         for gy in 0..height as i32 {
             let mut row = Vec::with_capacity(width as usize);
             for gx in 0..width as i32 {
-                // Map grid position to field voxel (centered on organism)
-                let vx = center_voxel.0 + (gx - half_w);
-                let vy = center_voxel.1 + (gy - half_h);
+                let mut vx = center_voxel.0 + (gx - half_w);
+                let mut vy = center_voxel.1 + (gy - half_h);
 
-                let amplitude = sanctuary.density_at((vx, vy, 0));
+                if let Some(ws) = world_size {
+                    vx = ((vx % ws) + ws) % ws;
+                    vy = ((vy % ws) + ws) % ws;
+                }
+
+                let amplitude = sanctuary.luminance_at((vx, vy, 0));
                 let phase = sanctuary.phase_at((vx, vy, 0));
 
-                // Amplitude → Brightness [0.0, 1.0]
                 let brightness = (amplitude / MAX_VISIBLE_AMPLITUDE).min(1.0);
 
-                // Phase → Hue, then combine with brightness to get RGB
                 let rgb = Self::phase_brightness_to_rgb(phase, brightness);
                 row.push(rgb);
             }

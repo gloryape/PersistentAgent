@@ -15,7 +15,7 @@
 //! Important: Identity consults MemoryGraph (via MemoryContext), not a
 //! separate identity state. MemoryGraph IS identity.
 
-use super::{Vehicle, VehicleType, Perspective, MemoryContext};
+use super::{Vehicle, VehicleType, Perspective, MemoryContext, EnvironmentContext};
 use crate::cognition::triune::TriuneResult;
 use crate::motor::Modality;
 
@@ -120,31 +120,45 @@ impl Vehicle for IdentityVehicle {
         VehicleType::Identity
     }
 
-    fn interpret(&self, triune: &TriuneResult, memory_context: Option<&MemoryContext>) -> Perspective {
-        let identity_alignment = self.assess_identity_alignment(triune, memory_context);
-        let confidence = self.assess_confidence(triune, memory_context);
-        
-        // Determine modality hint based on identity alignment
-        let modality_hint = if identity_alignment > 0.7 {
-            // Aligned -> proceed
-            Some(Modality::Movement)
-        } else if identity_alignment < 0.3 {
-            // Strong challenge -> pause and reflect (rest)
-            Some(Modality::Rest)
-        } else {
-            // Uncertain -> look inward (internal focus, mapped to eyes)
-            Some(Modality::Eyes)
+    fn interpret(
+        &self,
+        triune: &TriuneResult,
+        memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
+    ) -> Perspective {
+        let env = match env_context {
+            Some(e) => e,
+            None => return Perspective::empty(VehicleType::Identity),
         };
-        
+
+        let current_q = env.current_heading_quadrant as usize;
+        let consistency = env.heading_consistency;
+
+        let mut quadrant_scores = [0.5f32; 4];
+        for q in 0..4 {
+            if q == current_q {
+                quadrant_scores[q] = 0.5 + consistency * 0.4;
+            } else {
+                quadrant_scores[q] = 0.5 - consistency * 0.3;
+            }
+        }
+
+        let identity_alignment = quadrant_scores[current_q];
+        let confidence = ((consistency - 0.6) / 0.4).max(0.0);
+
         Perspective {
             vehicle_type: VehicleType::Identity,
             structural_truth: None,
             emotional_intent: None,
             identity_alignment: Some(identity_alignment),
             possibility_space: None,
-            modality_hint,
+            modality_hint: Some(Modality::Movement),
+            recommended_quadrant: Some(env.current_heading_quadrant),
             confidence,
-            interpretation: self.generate_interpretation(identity_alignment, triune, memory_context),
+            interpretation: format!(
+                "Trajectory: heading Q{} with consistency {:.2}",
+                current_q, consistency
+            ),
         }
     }
 }

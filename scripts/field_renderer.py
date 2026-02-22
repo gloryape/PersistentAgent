@@ -35,6 +35,15 @@ TICKS_PER_SECOND = 90.0
 
 
 @dataclass
+class AgentInfo:
+    """Per-agent rendering info (position, phase, coherence)."""
+    agent_id: str
+    position: Tuple[int, int]  # (voxel_x, voxel_y)
+    phase: float               # radians
+    coherence: Optional[float] # 0.0–1.0
+
+
+@dataclass
 class FieldGrid:
     """Structured field data for rendering. Bounds and arrays in voxel space."""
     x_min: int
@@ -48,11 +57,12 @@ class FieldGrid:
     efficiency_grid: np.ndarray # (height, width), float
     tick_grid: np.ndarray       # (height, width), float (tick of last interaction)
     current_tick: float
-    agent_position: Optional[Tuple[int, int]]  # (voxel_x, voxel_y) for grid indexing
-    agent_phase: Optional[float]  # radians, for direction arrow
-    agent_coherence: Optional[float]  # 0.0–1.0 metabolic coherence (motor unlock %)
-    max_tick: float  # for incremental caching
-    _voxel_df: Optional[pd.DataFrame] = field(default=None, repr=False)  # for incremental merge
+    agent_position: Optional[Tuple[int, int]]  # (voxel_x, voxel_y) primary agent
+    agent_phase: Optional[float]  # radians, primary agent
+    agent_coherence: Optional[float]  # 0.0–1.0 primary agent
+    agents: list = field(default_factory=list)  # List[AgentInfo] for all agents
+    max_tick: float = 0.0
+    _voxel_df: Optional[pd.DataFrame] = field(default=None, repr=False)
 
 
 def _ensure_columns(df: pd.DataFrame) -> bool:
@@ -97,13 +107,31 @@ def reconstruct_field_from_parquet(
     if cached_grid is not None and cached_grid._voxel_df is not None:
         new_records = df_sorted[df_sorted['tick'] > cached_grid.max_tick]
         if new_records.empty:
-            # Update current_tick and agent from full df (latest row)
+            # Update current_tick and agent(s) from full df
             last = df_sorted.iloc[-1]
             agent_vx = int(last['voxel_x']) if 'voxel_x' in last else None
             agent_vy = int(last['voxel_y']) if 'voxel_y' in last else None
             agent_ph = float(last['phase']) if 'phase' in last else None
             agent_coh = float(last['coherence']) if 'coherence' in last.index else None
             agent_pos = (agent_vx, agent_vy) if agent_vx is not None and agent_vy is not None else None
+            # Preserve multi-agent list (same logic as full rebuild)
+            all_agents = []
+            if 'agent_id' in df_sorted.columns:
+                for aid, grp in df_sorted.groupby('agent_id'):
+                    lr = grp.iloc[-1]
+                    all_agents.append(AgentInfo(
+                        agent_id=str(aid),
+                        position=(int(lr['voxel_x']), int(lr['voxel_y'])),
+                        phase=float(lr['phase']),
+                        coherence=float(lr['coherence']) if 'coherence' in lr.index else None,
+                    ))
+            if not all_agents and agent_pos is not None:
+                all_agents.append(AgentInfo(
+                    agent_id='agent_0',
+                    position=agent_pos,
+                    phase=agent_ph or 0.0,
+                    coherence=agent_coh,
+                ))
             return FieldGrid(
                 x_min=cached_grid.x_min, x_max=cached_grid.x_max,
                 y_min=cached_grid.y_min, y_max=cached_grid.y_max,
@@ -116,6 +144,7 @@ def reconstruct_field_from_parquet(
                 agent_position=agent_pos,
                 agent_phase=agent_ph,
                 agent_coherence=agent_coh,
+                agents=all_agents,
                 max_tick=cached_grid.max_tick,
                 _voxel_df=cached_grid._voxel_df,
             )
@@ -176,6 +205,25 @@ def reconstruct_field_from_parquet(
     agent_phase = float(last_row['phase'])
     agent_coherence = float(last_row['coherence']) if 'coherence' in last_row.index else None
 
+    # Extract ALL agents' latest positions (if agent_id column exists)
+    all_agents = []
+    if 'agent_id' in df_sorted.columns:
+        for aid, grp in df_sorted.groupby('agent_id'):
+            lr = grp.iloc[-1]
+            all_agents.append(AgentInfo(
+                agent_id=str(aid),
+                position=(int(lr['voxel_x']), int(lr['voxel_y'])),
+                phase=float(lr['phase']),
+                coherence=float(lr['coherence']) if 'coherence' in lr.index else None,
+            ))
+    if not all_agents:
+        all_agents.append(AgentInfo(
+            agent_id='agent_0',
+            position=(agent_vx, agent_vy),
+            phase=agent_phase,
+            coherence=agent_coherence,
+        ))
+
     # Bounds: clamp to max size (agent-centered), expand to min size
     width_raw = x_max - x_min + 1
     height_raw = y_max - y_min + 1
@@ -231,6 +279,7 @@ def reconstruct_field_from_parquet(
         agent_position=agent_position,
         agent_phase=agent_phase,
         agent_coherence=agent_coherence,
+        agents=all_agents,
         max_tick=max_tick,
         _voxel_df=latest,
     )

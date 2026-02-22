@@ -176,6 +176,25 @@ impl AnalyticalMind {
                 // Pad to 8 features
                 features.extend(vec![0.0; 5]);
             }
+            StimulusSource::Proprioceptive {
+                quadrant_brightness,
+                coverage,
+                directional_contrast,
+                brightest_quadrant,
+                mean_brightness,
+            } => {
+                // Spatial structure features — 8 real values, no zero padding.
+                // Normalize quadrant brightness relative to the brightest quadrant
+                let max_bright = quadrant_brightness.iter().cloned().fold(0.0f32, f32::max).max(1.0);
+                features.push(quadrant_brightness[0] / max_bright); // NW relative
+                features.push(quadrant_brightness[1] / max_bright); // NE relative
+                features.push(quadrant_brightness[2] / max_bright); // SW relative
+                features.push(quadrant_brightness[3] / max_bright); // SE relative
+                features.push(*coverage);                           // How much of field is lit
+                features.push(*directional_contrast);               // How asymmetric
+                features.push(*brightest_quadrant as f32 / 3.0);    // Where is the structure
+                features.push(*mean_brightness / 255.0);            // Overall field energy
+            }
         }
         
         features

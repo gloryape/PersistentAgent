@@ -11,7 +11,7 @@
 //! Strength: Prevents nonsense
 //! Blind spot: Can justify harm if isolated (cold logic without care)
 
-use super::{Vehicle, VehicleType, Perspective, MemoryContext};
+use super::{Vehicle, VehicleType, Perspective, MemoryContext, EnvironmentContext};
 use crate::cognition::triune::TriuneResult;
 use crate::motor::Modality;
 
@@ -68,37 +68,65 @@ impl Vehicle for SaitamaVehicle {
         VehicleType::Saitama
     }
 
-    fn interpret(&self, triune: &TriuneResult, memory_context: Option<&MemoryContext>) -> Perspective {
-        let structural_truth = self.assess_structural_truth(triune);
-        let mut confidence = self.assess_confidence(triune);
-        
-        // Memory context can adjust confidence
+    fn interpret(
+        &self,
+        triune: &TriuneResult,
+        memory_context: Option<&MemoryContext>,
+        env_context: Option<&EnvironmentContext>,
+    ) -> Perspective {
+        let env = match env_context {
+            Some(e) => e,
+            None => return Perspective::empty(VehicleType::Saitama),
+        };
+
+        // Structural truth: which quadrant has the best stiffness-to-amplitude ratio?
+        // Low stiffness + moderate amplitude = navigable. High stiffness = stiffened wake = hostile.
+        let mut quadrant_scores = [0.0f32; 4];
+        for q in 0..4 {
+            let stiff = env.quadrant_stiffness[q];
+            let amp = env.quadrant_amplitude[q];
+            if amp < 0.01 {
+                quadrant_scores[q] = 0.5; // Empty: neutral
+            } else {
+                quadrant_scores[q] = (1.0 - stiff / (stiff + 1.0)).max(0.0);
+            }
+        }
+
+        let best_q = quadrant_scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let structural_truth = quadrant_scores[best_q];
+        let best_q = best_q as u8;
+
+        let mut confidence = triune.analytical.signal_strength;
         if let Some(ctx) = memory_context {
-            // If we've seen similar patterns before, more confidence
             confidence = (confidence + ctx.familiarity * 0.1).min(1.0);
         }
-        
-        // Determine modality hint based on truth assessment
+
         let modality_hint = if structural_truth > self.truth_threshold {
-            // Truth detected -> proceed with action
             Some(Modality::Movement)
         } else if structural_truth < 0.3 {
-            // No truth -> rest/wait for more data
             Some(Modality::Rest)
         } else {
-            // Uncertain -> look more closely
             Some(Modality::Eyes)
         };
-        
+
         Perspective {
             vehicle_type: VehicleType::Saitama,
             structural_truth: Some(structural_truth),
-            emotional_intent: None,  // Not our domain
+            emotional_intent: None,
             identity_alignment: None,
             possibility_space: None,
             modality_hint,
+            recommended_quadrant: Some(best_q),
             confidence,
-            interpretation: self.generate_interpretation(structural_truth, triune),
+            interpretation: format!(
+                "Structural analysis: Q{} most navigable (score={:.2}, stiff={:.2})",
+                best_q, quadrant_scores[best_q as usize], env.quadrant_stiffness[best_q as usize]
+            ),
         }
     }
 }
